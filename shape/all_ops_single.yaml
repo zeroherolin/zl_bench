@@ -1055,11 +1055,9 @@ fused_marlin_moe_w4a16_mxfp4:
   shape_desc: num_tokens, num_experts, hidden_size, intermediate_size, topk
   shapes:
   - [1, 8, 4096, 14336, 2]
-fused_marlin_moe_w8a16_fp8:
-  shape_desc: num_tokens, num_experts, hidden_size, intermediate_size, topk
-  shapes:
-  - [1, 8, 4096, 14336, 2]
-fused_marlin_moe_w8a16_int8:
+# Upstream gives both W8A16 marlin benchmarks (fp8 and int8) the op_name
+# 'fused_marlin_moe_w8a16', so one entry drives both.
+fused_marlin_moe_w8a16:
   shape_desc: num_tokens, num_experts, hidden_size, intermediate_size, topk
   shapes:
   - [1, 8, 4096, 14336, 2]
@@ -1544,10 +1542,6 @@ max_pool2d_with_indices:
   shapes:
   - [32, 128, 28, 28]
 max_pool3d:
-  shape_desc: N, C, D, H, W
-  shapes:
-  - [4, 3, 16, 56, 56]
-max_pool3d_backward:
   shape_desc: N, C, D, H, W
   shapes:
   - [4, 3, 16, 56, 56]
@@ -2357,10 +2351,6 @@ tanh_backward:
   shape_desc: (B), M, N
   shapes:
   - [4096, 4096]
-tensor_split:
-  shape_desc: M, N
-  shapes:
-  - [64, 64]
 threshold:
   shape_desc: M, N
   shapes:
@@ -2393,7 +2383,7 @@ topk_softplus_sqrt:
   shape_desc: num_tokens, num_experts, topk
   shapes:
   - [4096, 256, 6]
-topk_w8a16_fp8:
+topk_w8a16:
   shape_desc: M, N, K
   shapes:
   - [128, 1024, 16]

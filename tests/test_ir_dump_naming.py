@@ -46,3 +46,47 @@ def test_rows_tsv_prefers_the_timed_kernels(tmp_path, monkeypatch):
     assert lines[1:] == ["softmax\ttorch.float16\t0\t4x4\tH1,H2\ttimed",
                          "softmax\ttorch.float16\t1\t8x8\tH4\trow",
                          "softmax\ttorch.float16\t2\tx\t?\t-"]
+
+
+def test_short_label_is_unchanged():
+    assert dump._label_of([64, 256, 1, 1, 8]) == "64x256x1x1x8"
+    assert dump._label_of("mm") == "mm"
+
+
+def test_long_label_fits_a_directory_name_and_stays_distinct():
+    # a varlen attention case carries its cu_seqlens: the plain join is far over the
+    # 255-byte limit, and a name the filesystem rejects used to fail the whole dump
+    a = dump._label_of(list(range(300)))
+    b = dump._label_of(list(range(1, 301)))
+    assert len(a) <= dump._MAX_LABEL and len(b) <= dump._MAX_LABEL
+    assert a != b
+    assert a.startswith("0x1x2x3x")   # still readable at the front
+
+
+def test_dump_failure_is_reported_not_swallowed(tmp_path, capsys, monkeypatch):
+    # the dump runs from an atexit hook, after pytest called the run a pass; an error
+    # there must be visible, or the missing IR only surfaces in a later gate
+    def boom(cache_dir, run_dir):
+        raise OSError(36, "File name too long")
+
+    monkeypatch.setattr(dump, "_dump_ir", boom)
+    dump._dump_ir_guarded(str(tmp_path), str(tmp_path))
+    err = capsys.readouterr().err
+    assert "IR_DUMP_FAILED" in err
+    assert "File name too long" in err
+
+
+def test_rows_tsv_survives_a_failing_ir_dump(tmp_path, capsys, monkeypatch):
+    # rows.tsv is what attributes result rows to kernels; the much larger IR copy
+    # failing (a rejected path, a cache file that went away) must not take it along
+    written = []
+
+    def boom(cache_dir, run_dir):
+        raise OSError(36, "File name too long")
+
+    monkeypatch.setattr(dump, "_write_rows", written.append)
+    monkeypatch.setattr(dump, "_dump_ir", boom)
+    dump._dump_ir_guarded(str(tmp_path), str(tmp_path))
+    assert written, "rows.tsv was not written when the IR dump failed"
+    err = capsys.readouterr().err
+    assert "IR_DUMP_FAILED" in err and "ROWS_TSV_FAILED" not in err

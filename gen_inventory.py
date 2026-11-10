@@ -79,6 +79,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--refresh-shapes", type=Path, default=None, metavar="YAML",
                    help="refresh this shape set in place "
                         "(drop stale keys, sync the core_shapes base)")
+    p.add_argument("--check-shapes", type=Path, action="append", default=None, metavar="YAML",
+                  help="report keys of these shape sets that match no current op_name or "
+                       "Benchmark class; such a key is silently ignored at run time "
+                       "(repeatable). Unlike --refresh-shapes this never rewrites the file")
     p.add_argument("--one-shape", action="store_true",
                    help="single-shape set: keys whose value equals upstream core_shapes "
                         "(not hand-curated) keep one representative shape")
@@ -292,6 +296,51 @@ def refresh_shapes(path: Path, valid_op_names: Set[str],
           "have no entry (upstream default shapes)")
 
 
+def check_shapes(paths, valid_op_names, repos) -> int:
+    """Report shape-set keys that match no current op_name or Benchmark class.
+
+    Upstream renames an op_name now and then. A set still keyed on the old name
+    matches nothing, upstream falls back to the benchmark's own hardcoded shapes
+    and the run looks clean, so nothing but a check like this catches the drift.
+    Valid keys are the op_names, the Benchmark class names (upstream's set_shapes
+    falls back along the MRO) and whatever each repo's core_shapes.yaml defines.
+    Returns the number of stale keys; never rewrites a file.
+    """
+    classes, core_keys = set(), set()
+    for _label, root in repos:
+        for path in sorted((root / "benchmark").rglob("*.py")):
+            try:
+                tree = ast.parse(path.read_text(errors="replace"))
+            except SyntaxError:
+                continue
+            classes |= set(n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef))
+        core = root / "benchmark" / "core_shapes.yaml"
+        if core.is_file():
+            core_keys |= set(yaml.safe_load(core.read_text()) or dict())
+    known = set(valid_op_names) | classes | core_keys
+    stale_total = 0
+    for path in paths:
+        if not path.is_file():
+            print(f"[gen] check-shapes: no {path}")
+            continue
+        try:
+            entries = yaml.safe_load(path.read_text()) or dict()
+        except yaml.YAMLError as exc:
+            print(f"[gen] check-shapes: {path} is not valid YAML: {str(exc).splitlines()[0]}")
+            continue
+        if not isinstance(entries, dict):
+            print(f"[gen] check-shapes: {path} is not a mapping of op_name -> entry; skipped")
+            continue
+        stale = sorted(k for k in entries if k not in known)
+        stale_total += len(stale)
+        detail = ": " + ", ".join(stale[:10]) + (" ..." if len(stale) > 10 else "") if stale else ""
+        print(f"[gen] check-shapes: {path} {len(entries)} keys, {len(stale)} stale{detail}")
+    if stale_total:
+        print(f"[gen] check-shapes: {stale_total} key(s) would be ignored at run time; rename them "
+              "to the current op_name or drop them")
+    return stale_total
+
+
 def main() -> None:
     args = parse_args()
     repos = _resolve_repos(args.repo)
@@ -311,6 +360,9 @@ def main() -> None:
         n_skip = sum(1 for r in rows if r["marked_skip"])
         print(f"[gen] {label}: {len(rows)} test functions -> {out} "
               f"({n_skip} with an unconditional skip mark)")
+
+    if args.check_shapes:
+        check_shapes(args.check_shapes, all_op_names, repos)
 
     if args.refresh_shapes:
         refresh_shapes(args.refresh_shapes, all_op_names, repos, one_shape=args.one_shape)

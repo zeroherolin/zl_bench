@@ -30,6 +30,7 @@ MIN_ROUNDS = 6
 THRESHOLD = 0.005
 ALPHA = 0.01
 CLEAR = 0.10
+ALPHA_PAIRED = 0.05   # sign test over the paired rounds: 6 agreeing pairs are p = 0.031
 
 VERDICTS = ("faster", "slower", "same", "undecided")
 
@@ -103,6 +104,45 @@ def mann_whitney_u(x: Sequence[float], y: Sequence[float],
     return u1, min(1.0, max(0.0, p * factor))
 
 
+def sign_test(a: Sequence[float], b: Sequence[float]) -> Tuple[int, int, float]:
+    """Two-sided exact sign test over the paired rounds: (wins for B, decisive pairs, p).
+
+    Each round runs both sides back to back on one GPU, so a pair cancels the GPU and the
+    slow drift the unpaired rank test has to absorb. Six paired rounds that all point the
+    same way are p = 0.031, while the unpaired test over 6 vs 6 samples cannot go below
+    p = 0.002 and needs the samples to separate completely -- without the pairing, real
+    and stable differences of a few percent stay undecided.
+    """
+    wins = sum(1 for x, y in zip(a, b, strict=True) if x > y)
+    losses = sum(1 for x, y in zip(a, b, strict=True) if x < y)
+    n = wins + losses
+    if n == 0:
+        return 0, 0, 1.0
+    tail = sum(math.comb(n, i) for i in range(min(wins, losses) + 1))
+    return wins, n, min(1.0, 2.0 * tail / (2 ** n))
+
+
+def _paired_p(a: Sequence[float], b: Sequence[float]) -> float:
+    """Sign-test p of the paired rounds; nan when the rounds do not pair up."""
+    return sign_test(a, b)[2] if a and len(a) == len(b) else math.nan
+
+
+def _decide_on_pairing(a, b, gap, verdict, threshold, alpha_paired) -> str:
+    """Decide a row the unpaired test left open, using the pairing.
+
+    Only when every round agrees and the median effect clears the same threshold the
+    unpaired rule uses, so the pairing adds evidence without lowering the bar.
+    """
+    if verdict != "undecided" or len(a) != len(b) or abs(gap) <= threshold:
+        return verdict
+    if _paired_p(a, b) >= alpha_paired:
+        return verdict
+    ratios = [x / y for x, y in zip(a, b, strict=True)]
+    if min(ratios) > 1 or max(ratios) < 1:
+        return "faster" if gap > 0 else "slower"
+    return verdict
+
+
 class RowStats(NamedTuple):
     n_a: int
     n_b: int
@@ -111,11 +151,12 @@ class RowStats(NamedTuple):
     gap: float          # median_a / median_b - 1, > 0: B faster
     p: float            # two-sided Mann-Whitney; nan below two samples per side
     verdict: str
+    p_paired: float = math.nan   # two-sided sign test over the paired rounds
 
 
 def compare(a: Sequence[float], b: Sequence[float], *, min_rounds: int = MIN_ROUNDS,
             threshold: float = THRESHOLD, alpha: float = ALPHA,
-            clear: float = CLEAR) -> RowStats:
+            clear: float = CLEAR, alpha_paired: float = ALPHA_PAIRED) -> RowStats:
     """Verdict of one row from its A and B latency samples (one per round)."""
     if not a or not b:
         raise ValueError("both sides need at least one sample")
@@ -132,7 +173,8 @@ def compare(a: Sequence[float], b: Sequence[float], *, min_rounds: int = MIN_ROU
         verdict = "same"
     else:
         verdict = "undecided"
-    return RowStats(len(a), len(b), ma, mb, gap, p, verdict)
+    verdict = _decide_on_pairing(a, b, gap, verdict, threshold, alpha_paired)
+    return RowStats(len(a), len(b), ma, mb, gap, p, verdict, _paired_p(a, b))
 
 
 def geomean(values: Sequence[float]) -> float:

@@ -1,6 +1,8 @@
+import csv
 import json
 
 import ab_compare
+import ab_stats
 
 HEADER = "Operator: softmax  (dtype=torch.bfloat16, mode=kernel, level=core)\n"
 
@@ -71,3 +73,34 @@ def test_analyze_pairs_rounds_and_applies_the_gate(tmp_path):
     only_late = ab_compare.analyze(out, gate, (4, 6))
     assert only_late[0].row.rounds == [4, 5, 6]
     assert ab_compare.op_labels(out) == {"main/softmax": "main:softmax@softmax"}
+
+
+def _result(verdict="faster", p=0.002, p_paired=0.031):
+    """One analysed row, enough for write_csv."""
+    row = ab_compare.Row(run="vllm/mm", op_name="mm", dtype="torch.bfloat16", row=0,
+                    size="[torch.Size([8])]", a=[1.0] * 6, b=[0.9] * 6,
+                    rounds=list(range(1, 7)), nocg=False, fallback=False)
+    stats = ab_stats.RowStats(6, 6, 1.0, 0.9, 0.111, p, verdict, p_paired)
+    return ab_compare.Result(row, stats, "changed")
+
+
+def test_write_csv_header_matches_every_row(tmp_path):
+    out = tmp_path / "rows.csv"
+    ab_compare.write_csv(out, [_result(), _result("same", 0.4, 1.0)], {})
+    rows = list(csv.reader(out.open()))
+    assert len(rows) == 3
+    assert len(set(len(r) for r in rows)) == 1, "a row does not match the header"
+
+
+def test_write_csv_carries_the_paired_p(tmp_path):
+    # the README points readers at this column to see why a row was decided
+    out = tmp_path / "rows.csv"
+    ab_compare.write_csv(out, [_result(p_paired=0.031)], {})
+    rows = list(csv.DictReader(out.open()))
+    assert rows[0]["p_paired"] == "0.031"
+
+
+def test_write_csv_leaves_a_missing_paired_p_empty(tmp_path):
+    out = tmp_path / "rows.csv"
+    ab_compare.write_csv(out, [_result(p_paired=float("nan"))], {})
+    assert list(csv.DictReader(out.open()))[0]["p_paired"] == ""

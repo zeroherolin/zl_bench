@@ -50,9 +50,9 @@ zl_bench 会 monkeypatch 上游内部实现，可用性与测试时的上游版�
 
 | 组件 | Commit | 日期 | 来源 |
 |---|---|---|---|
-| FlagGems | [`68c6aa64c`](https://github.com/flagos-ai/FlagGems/commit/68c6aa64c2aa82b485b2a978bf9fda08aae87db1) | 2026-10-09 | `flagos-ai/FlagGems` master |
-| FlagGems-vllm | [`31fcc73`](https://github.com/flagos-ai/FlagGems-vllm/commit/31fcc73c76eb41cc003f5890c5faeca24814ba5b) | 2026-10-09 | `flagos-ai/FlagGems-vllm` main |
-| FlagTree | [`0d4c7b4`](https://github.com/flagos-ai/FlagTree/commit/0d4c7b4a3db375693bc5f9844312c49e40430bb8) | 2026-10-09 | `flagos-ai/FlagTree` main |
+| FlagGems | [`a4e2556d5`](https://github.com/flagos-ai/FlagGems/commit/a4e2556d5) | 2026-11-04 | `flagos-ai/FlagGems` master |
+| FlagGems-vllm | [`a579b7c`](https://github.com/flagos-ai/FlagGems-vllm/commit/a579b7c) | 2026-11-10 | `flagos-ai/FlagGems-vllm` main |
+| FlagTree | [`6d7597f66`](https://github.com/flagos-ai/FlagTree/commit/6d7597f66) | 2026-11-10 | `flagos-ai/FlagTree` main |
 
 环境：NVIDIA H20（Hopper，驱动 595.45）、CUDA 13.0、PyTorch 2.11.0、Python 3.12、vLLM 0.20.2。换用其他上游版本时，先重建算子清单、刷新 shape 集（见[跟进上游更新](#跟进上游更新)）；每个 `run.log` 都会记录实际使用的 Triton 路径与 git 版本。
 
@@ -155,7 +155,7 @@ python ab_compare.py runs/ab_dev -v --csv runs/ab_dev/rows.csv
 ```
 
 - 每个（算子, 轮次）在同一张卡上先后跑 A 和 B，奇数轮先 A、偶数轮先 B，抵消卡间偏差和缓慢漂移。所有任务共用一个队列、分到所有卡上，耗时长的先跑；每次运行都是新进程，各轮是独立样本。每次运行的处理与[批量测试](#批量测试)相同（超时、重试、空闲检查）。`<out>/r<k>_a` 与 `r<k>_b` 的结构与批次目录相同；用同一个 `--out` 重跑即断点续跑。
-- 每行的判定（[详情](docs/design.zh-CN.md#统计判定)）：至少 `--min-rounds`（6）轮，中位数之差超过 `--threshold`（0.5%）且双侧 Mann-Whitney 检验 p < `--alpha`（0.01）时为 `faster` / `slower`；差距在阈值内或 p ≥ `--clear`（0.1）时为 `same`；其余为 `undecided`。`--until-decided` 给有 undecided 行的算子每次补 `--step` 轮，直到 `--max-rounds`（14）。
+- 每行的判定（[详情](docs/design.zh-CN.md#统计判定)）：至少 `--min-rounds`（6）轮，中位数之差超过 `--threshold`（0.5%）且双侧 Mann-Whitney 检验 p < `--alpha`（0.01）时为 `faster` / `slower`；差距在阈值内或 p ≥ `--clear`（0.1）时为 `same`；其余为 `undecided`。`--until-decided` 给有 undecided 行的算子每次补 `--step` 轮，直到 `--max-rounds`（14）。（判为 `undecided` 的行，若各轮方向一致且差距超过 `--threshold`，改用配对判定：每轮两侧在同一张卡上背靠背运行，配对可抵消卡间差异与慢漂移；6 轮同向的双边符号检验 p = 0.031，即 `--alpha-paired`。CSV 中为 `p_paired` 列。）
 - `gap = median(A) / median(B) − 1`，B 更快时为正。它是在该记录的 config 下编译器改动的效果，而不是两侧各自最优之间的差（[原因](docs/design.zh-CN.md#两侧各自最优)）。
 - 加 `--gate <ir_gate 输出目录>`（见下一节）后，kernel 在两侧编译成同一二进制的行作为对照组：它们不可能有差别，`ab_compare.py` 会报告其中被判为 faster 或 slower 的数量，即实测误报率。
 - **证据弱的结果用全新的轮次复测。** 差距小或噪声大的行，是用同一批样本既挑出来又判定的，会被高估。`ab_compare.py --recheck-list` 写出含这类行（|gap| < 2%、|gap| 小于样本变异系数的 2 倍，或用 do_bench 计时）的算子；`ab_run.py --add-rounds 6` 给它们补新的轮次，编号接在已有轮次之后；`ab_compare.py --confirm <起>-<止>`（`ab_run.py` 会打印这个范围）先用其余轮次判定每一行，faster/slower 的行只有在新轮次单独也能复现（单侧，p < 0.05）时才保留：
@@ -318,6 +318,14 @@ runs/softmax_20260716-031752/
    python gen_inventory.py --refresh-shapes shape/all_ops_single.yaml --one-shape
    python gen_inventory.py --refresh-shapes shape/all_ops_multi.yaml
    ```
+
+   自定义 shape 集（`all_ops_*` 以外的）不会被 `--refresh-shapes` 重写，改用 `--check-shapes` 检查并按提示修正：
+
+   ```bash
+   python gen_inventory.py --check-shapes shape/DeepSeek-V4-Flash-p4096d1024.yaml --check-shapes my_shapes.yaml
+   ```
+
+   匹配不到当前 op_name 的键**在运行时被静默忽略**：上游回退到基准自带的硬编码 shape，运行看起来完全正常，但测的不是指定的 shape。运行时还会在本次运行的算子找不到条目时打印 `SHAPE_KEYS_UNUSED`，在 IR 落盘或行到内核的映射写入失败时打印 `IR_DUMP_FAILED` / `ROWS_TSV_FAILED`，两者都可在 `run.log` 中 grep。
 
    `--refresh-shapes` 只保留上游仍存在的 op_name 键，并同步 core_shapes 的键。改名算子的键会移到 `shape/<name>.unmatched.yaml`：找到新名（`grep -rn 'op_name=' $FLAGGEMS_DIR/benchmark/test_<op>.py`）后挪回，再删掉这个文件。
 3. 跑一次全量筛查。确认为上游或环境问题的失败写进 `ops/dismiss.txt` 并注明原因与日期；也定期用 `--ops-file` 重跑清单里的算子，移出已恢复的。

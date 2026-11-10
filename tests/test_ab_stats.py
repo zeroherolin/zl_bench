@@ -60,8 +60,20 @@ def test_compare_overlapping_samples():
     b = [1.03, 1.09, 1.00, 1.13, 1.04, 1.08]
     r = ab_stats.compare(a, b)
     assert r.p >= ab_stats.CLEAR and r.verdict == "same"
-    # a real but noisy shift lands in between: more rounds needed
+    # A shift the unpaired test leaves in between, but every round points the same way:
+    # the pairing decides it (a round runs both sides back to back on one GPU).
     a = [1.00, 1.04, 1.02, 1.06, 1.01, 1.05]
     b = [0.99, 1.01, 0.98, 1.03, 0.97, 1.00]
     r = ab_stats.compare(a, b)
-    assert ab_stats.ALPHA <= r.p < ab_stats.CLEAR and r.verdict == "undecided"
+    assert ab_stats.ALPHA <= r.p < ab_stats.CLEAR
+    assert r.p_paired < ab_stats.ALPHA_PAIRED and r.verdict == "faster"
+    # a gap of the same size with one round disagreeing is not decided by the pairing
+    a2 = [1.0340, 1.0661, 1.0099, 1.0179, 1.0502, 1.0758]
+    b2 = [1.0162, 1.0017, 1.0481, 0.9737, 1.0387, 0.9932]
+    r2 = ab_stats.compare(a2, b2)
+    assert r2.gap > ab_stats.THRESHOLD and r2.p_paired >= ab_stats.ALPHA_PAIRED
+    assert r2.verdict == "undecided"
+    # agreeing rounds below --threshold stay "same": the pairing adds evidence, not reach
+    a3 = [1.0010, 1.0012, 1.0011, 1.0013, 1.0010, 1.0012]
+    b3 = [1.0000, 1.0002, 1.0001, 1.0003, 1.0000, 1.0002]
+    assert ab_stats.compare(a3, b3).verdict == "same"

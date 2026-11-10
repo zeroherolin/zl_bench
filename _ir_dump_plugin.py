@@ -47,6 +47,7 @@ Triton cache dir:
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import re
@@ -60,6 +61,7 @@ from _fg_benchmark import benchmark_classes
 from _term_style import DIM, paint, tag
 
 _TAG = "[ir-dump-plugin]"
+_MAX_LABEL = 120   # a label is a directory name; filesystems stop at 255 bytes
 _DUMP_DIR_ENV = "FLAGGEMS_PERF_IR_DUMP_DIR"
 
 _fn_to_cachedir: dict = {}   # GPU function handle -> cache-dir basename
@@ -181,10 +183,24 @@ def _wrap_bench(original):
     return wrapped
 
 
+def _fit(label):
+    """Keep a label usable as a directory name.
+
+    Labels become directories under ttgir/. A shape can be long (a varlen attention
+    case carries its cu_seqlens), and a name over the filesystem's 255-byte limit
+    makes the whole dump fail. Truncate and append a digest, so long labels stay
+    readable at the front and distinct at the back.
+    """
+    if len(label) <= _MAX_LABEL:
+        return label
+    digest = hashlib.sha1(label.encode()).hexdigest()[:12]
+    return label[:_MAX_LABEL - len(digest) - 1] + "_" + digest
+
+
 def _label_of(shape):
     if isinstance(shape, (list, tuple)):
-        return "x".join(re.sub(r"\W", "", str(v)) for v in shape)
-    return re.sub(r"\W", "", str(shape))
+        return _fit("x".join(re.sub(r"\W", "", str(v)) for v in shape))
+    return _fit(re.sub(r"\W", "", str(shape)))
 
 
 def _shape_label(bench, idx):
@@ -408,6 +424,39 @@ def _compile_options(info) -> dict:
     return meta
 
 
+def _dump_ir_guarded(cache_dir: str, run_dir: str) -> None:
+    """Run the dump at exit, reporting rather than losing everything on an error.
+
+    The dump runs from an atexit hook, after pytest has decided the run passed. An
+    exception there (a path the filesystem rejects, a cache file another process
+    removed) would otherwise take ttgir/, ttir/ and rows.tsv with it silently, and
+    the run would still look complete -- the IR is only missed much later, when a
+    gate or an A/B has nothing to attribute rows to.
+    """
+    import pathlib
+
+    # rows.tsv first and on its own: it is what attributes result rows to kernels,
+    # and it costs nothing, so a failure in the much larger IR copy below must not
+    # take it down with it.
+    try:
+        _write_rows(pathlib.Path(run_dir) / "rows.tsv")
+    except Exception:
+        import traceback
+
+        print(f"{tag(_TAG)} ROWS_TSV_FAILED {run_dir}: --gate cannot attribute this run's rows",
+              file=sys.stderr, flush=True)
+        traceback.print_exc()
+    try:
+        _dump_ir(cache_dir, run_dir)
+    except Exception:
+        import traceback
+
+        print(f"{tag(_TAG)} IR_DUMP_FAILED {run_dir}: the run's numbers are fine, but it has "
+              "no ttgir/ttir/rows.tsv, so ir_gate.py and --gate cannot attribute its rows",
+              file=sys.stderr, flush=True)
+        traceback.print_exc()
+
+
 def _dump_ir(cache_dir: str, run_dir: str) -> None:
     import pathlib
     import shutil
@@ -479,8 +528,6 @@ def _dump_ir(cache_dir: str, run_dir: str) -> None:
             rows.append(("-", info["kernel"], "(sweep loser, not dumped)", 0, sweep,
                          info["warps"] or "", info["stages"] or "",
                          json.dumps(info["constexprs"], sort_keys=True), info["hash"]))
-
-    _write_rows(pathlib.Path(run_dir) / "rows.tsv")
 
     rows.sort()
     with open(dest / "index.tsv", "w") as f:
@@ -562,7 +609,7 @@ def pytest_configure(config):
     triton.knobs.runtime.kernel_load_end_hook.add(_load_hook)
     triton.knobs.runtime.launch_enter_hook.add(_launch_hook)
     _autotuner.Autotuner._bench = _wrap_bench(_autotuner.Autotuner._bench)
-    atexit.register(_dump_ir, cache_dir, run_dir)
+    atexit.register(_dump_ir_guarded, cache_dir, run_dir)
     _dump_enabled = True
     print(f"{tag(_TAG)} shape/launch tracking on; IR dump -> {run_dir}/{{ttgir,ttir}}",
           file=sys.stderr, flush=True)

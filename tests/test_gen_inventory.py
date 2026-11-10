@@ -66,3 +66,57 @@ def test_refresh_shapes(tmp_path):
     assert "renamed_op" not in out
     unmatched = yaml.safe_load((tmp_path / "set.unmatched.yaml").read_text())
     assert unmatched == {"renamed_op": {"shapes": [[1]]}}
+
+
+def _repo(tmp_path, op_names=(), class_names=(), core_keys=()):
+    """A minimal repo whose benchmark/ declares the given op_names, classes and core shapes."""
+    bench = tmp_path / "benchmark"
+    bench.mkdir(parents=True, exist_ok=True)
+    body = ["import x"]
+    body += [f'B(op_name="{n}")' for n in op_names]
+    body += [f"class {n}(Base):\n    pass" for n in class_names]
+    (bench / "test_sample.py").write_text("\n".join(body) + "\n")
+    if core_keys:
+        (bench / "core_shapes.yaml").write_text(
+            "\n".join(f"{k}:\n  shapes:\n  - [1]" for k in core_keys) + "\n")
+    return tmp_path
+
+
+def test_check_shapes_flags_only_keys_upstream_lost(tmp_path, capsys):
+    repo = _repo(tmp_path / "r", op_names=["mm"], class_names=["BlasBenchmark"], core_keys=["from_core"])
+    y = tmp_path / "s.yaml"
+    y.write_text("mm:\n  shapes:\n  - [1]\nBlasBenchmark:\n  shapes:\n  - [2]\n"
+              "from_core:\n  shapes:\n  - [3]\nrenamed_away:\n  shapes:\n  - [4]\n")
+    assert gen.check_shapes([y], set(["mm"]), [("main", repo)]) == 1
+    assert "renamed_away" in capsys.readouterr().out
+
+
+def test_check_shapes_clean_set(tmp_path, capsys):
+    repo = _repo(tmp_path / "r", op_names=["mm"])
+    y = tmp_path / "s.yaml"
+    y.write_text("mm:\n  shapes:\n  - [1]\n")
+    assert gen.check_shapes([y], set(["mm"]), [("main", repo)]) == 0
+    assert "0 stale" in capsys.readouterr().out
+
+
+def test_check_shapes_missing_file_does_not_crash(tmp_path, capsys):
+    repo = _repo(tmp_path / "r", op_names=["mm"])
+    assert gen.check_shapes([tmp_path / "nope.yaml"], set(["mm"]), [("main", repo)]) == 0
+    assert "no " in capsys.readouterr().out
+
+
+def test_check_shapes_survives_a_malformed_file(tmp_path, capsys):
+    # these sets are hand-written, so a syntax slip is ordinary; it must not raise
+    repo = _repo(tmp_path / "r", op_names=["mm"])
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("not: [a, b\n")
+    assert gen.check_shapes([bad], set(["mm"]), [("main", repo)]) == 0
+    assert "not valid YAML" in capsys.readouterr().out
+
+
+def test_check_shapes_survives_a_file_that_is_not_a_mapping(tmp_path, capsys):
+    repo = _repo(tmp_path / "r", op_names=["mm"])
+    lst = tmp_path / "list.yaml"
+    lst.write_text("- just\n- a list\n")
+    assert gen.check_shapes([lst], set(["mm"]), [("main", repo)]) == 0
+    assert "not a mapping" in capsys.readouterr().out

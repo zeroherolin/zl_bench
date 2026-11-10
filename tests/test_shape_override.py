@@ -45,3 +45,36 @@ def test_standard_input_fn_signature():
     assert plugin._takes_shape_dtype_device(lambda shape, dtype, device: None)
     assert not plugin._takes_shape_dtype_device(lambda b, m, n, k, dtype, device, t: None)
     assert not plugin._takes_shape_dtype_device(None)
+
+
+def _session(monkeypatch, capsys, entries, ops_that_ran):
+    """Run the end-of-session check for a given yaml and a given set of ops."""
+    monkeypatch.setattr(plugin, "_entries", entries)
+    monkeypatch.setattr(plugin, "_looked_up", set())
+    monkeypatch.setattr(plugin, "_ops_run", set())
+    Bench = _patched(monkeypatch, entries)
+    for op_name in ops_that_ran:
+        Bench(op_name, [(9, 9, 9)]).init_user_config()
+    plugin.pytest_sessionfinish(None, 0)
+    return capsys.readouterr().err
+
+
+def test_renamed_key_is_reported(monkeypatch, capsys):
+    # the op ran but the yaml still carries its old name: it silently used its own shapes
+    err = _session(monkeypatch, capsys, dict(grouped_topk_old=dict(shapes=[[1, 2]])), ["grouped_topk"])
+    assert "SHAPE_KEYS_UNUSED" in err and "grouped_topk" in err
+
+
+def test_matching_key_is_silent(monkeypatch, capsys):
+    err = _session(monkeypatch, capsys, dict(grouped_topk=dict(shapes=[[1, 2]])), ["grouped_topk"])
+    assert "SHAPE_KEYS_UNUSED" not in err
+
+
+def test_keys_of_ops_that_did_not_run_are_not_reported(monkeypatch, capsys):
+    # a whole-suite set holds keys for every op; running one of them is not a problem
+    entries = dict(mm=dict(shapes=[[1, 2]]), softmax=dict(shapes=[[3]]))
+    assert "SHAPE_KEYS_UNUSED" not in _session(monkeypatch, capsys, entries, ["mm"])
+
+
+def test_no_shape_file_is_silent(monkeypatch, capsys):
+    assert "SHAPE_KEYS_UNUSED" not in _session(monkeypatch, capsys, dict(), ["mm"])

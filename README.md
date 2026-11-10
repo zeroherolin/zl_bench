@@ -50,9 +50,9 @@ zl_bench patches upstream internals, so it is tied to the upstream versions it w
 
 | Component | Commit | Date | Source |
 |---|---|---|---|
-| FlagGems | [`68c6aa64c`](https://github.com/flagos-ai/FlagGems/commit/68c6aa64c2aa82b485b2a978bf9fda08aae87db1) | 2026-10-09 | `flagos-ai/FlagGems` master |
-| FlagGems-vllm | [`31fcc73`](https://github.com/flagos-ai/FlagGems-vllm/commit/31fcc73c76eb41cc003f5890c5faeca24814ba5b) | 2026-10-09 | `flagos-ai/FlagGems-vllm` main |
-| FlagTree | [`0d4c7b4`](https://github.com/flagos-ai/FlagTree/commit/0d4c7b4a3db375693bc5f9844312c49e40430bb8) | 2026-10-09 | `flagos-ai/FlagTree` main |
+| FlagGems | [`a4e2556d5`](https://github.com/flagos-ai/FlagGems/commit/a4e2556d5) | 2026-11-04 | `flagos-ai/FlagGems` master |
+| FlagGems-vllm | [`a579b7c`](https://github.com/flagos-ai/FlagGems-vllm/commit/a579b7c) | 2026-11-10 | `flagos-ai/FlagGems-vllm` main |
+| FlagTree | [`6d7597f66`](https://github.com/flagos-ai/FlagTree/commit/6d7597f66) | 2026-11-10 | `flagos-ai/FlagTree` main |
 
 Environment: NVIDIA H20 (Hopper, driver 595.45), CUDA 13.0, PyTorch 2.11.0, Python 3.12, vLLM 0.20.2. With other upstream versions, rebuild the inventory and refresh the shape sets first ([Keeping up with upstream](#keeping-up-with-upstream)); each `run.log` records the Triton path and git revision it ran with.
 
@@ -155,7 +155,7 @@ python ab_compare.py runs/ab_dev -v --csv runs/ab_dev/rows.csv
 ```
 
 - Each (op, round) runs A and B back to back on one GPU, A first in odd rounds and B first in even ones, so per-GPU bias and slow drift cancel. Items share one queue over all GPUs, longest first; every run is a fresh process, so rounds are independent samples. Each run gets the same handling as in a [batch](#batch-runs) (timeout, retries, idle-GPU check). `<out>/r<k>_a` and `r<k>_b` are laid out like batch dirs; rerunning with the same `--out` resumes.
-- Verdict per row ([details](docs/design.md#statistics)): `faster` / `slower` when the medians differ by more than `--threshold` (0.5%) and a two-sided Mann-Whitney test gives p < `--alpha` (0.01) over at least `--min-rounds` (6) rounds; `same` within the threshold or at p ≥ `--clear` (0.1); otherwise `undecided`. `--until-decided` adds `--step` rounds to ops with undecided rows up to `--max-rounds` (14).
+- Verdict per row ([details](docs/design.md#statistics)): `faster` / `slower` when the medians differ by more than `--threshold` (0.5%) and a two-sided Mann-Whitney test gives p < `--alpha` (0.01) over at least `--min-rounds` (6) rounds; `same` within the threshold or at p ≥ `--clear` (0.1); otherwise `undecided`. `--until-decided` adds `--step` rounds to ops with undecided rows up to `--max-rounds` (14). A row left `undecided` is decided on the pairing when every round points the same way and the gap clears `--threshold`: the rounds run both sides back to back on one GPU, so a pair cancels the GPU and the drift the unpaired test must absorb (six agreeing pairs are a two-sided sign test at p = 0.031, `--alpha-paired`; the unpaired test over 6 vs 6 samples needs them to separate completely). The CSV carries `p_paired`.
 - `gap = median(A) / median(B) − 1`, positive when B is faster. It is the effect of the compiler change under the record's configs, not of each side at its own best ([why](docs/design.md#each-side-at-its-best)).
 - With `--gate <ir_gate out>` (next section), rows whose kernels compiled to the same binary on both sides are controls: they cannot differ, so `ab_compare.py` reports how many of them the rule calls faster or slower, the measured false-positive rate.
 - **Recheck weak results on fresh rounds.** A row with a small or noisy gap was selected and judged on the same samples, which overstates it. `ab_compare.py --recheck-list` writes the ops with such rows (|gap| < 2%, |gap| < 2× the samples' coefficient of variation, or do_bench timing); `ab_run.py --add-rounds 6` gives them new rounds numbered after the existing ones; `ab_compare.py --confirm <first>-<last>` (the range `ab_run.py` prints) judges every row on the other rounds and keeps a faster/slower row only if the new rounds alone reproduce it (one-sided, p < 0.05):
@@ -318,6 +318,14 @@ runs/softmax_20260716-031752/
    python gen_inventory.py --refresh-shapes shape/all_ops_single.yaml --one-shape
    python gen_inventory.py --refresh-shapes shape/all_ops_multi.yaml
    ```
+
+   Curated shape sets (anything other than `all_ops_*`) are not rewritten by `--refresh-shapes`; check them instead and fix what it reports:
+
+   ```bash
+   python gen_inventory.py --check-shapes shape/DeepSeek-V4-Flash-p4096d1024.yaml --check-shapes my_shapes.yaml
+   ```
+
+   A key matching no current op_name is **silently ignored at run time**: upstream falls back to the benchmark's own hardcoded shapes, the run looks clean, and the numbers are for shapes you did not ask for. A run also prints `SHAPE_KEYS_UNUSED` when an op it ran found no entry in the shape file, and `IR_DUMP_FAILED` / `ROWS_TSV_FAILED` when the IR dump or the row-to-kernel map could not be written — grep `run.log` for both.
 
    `--refresh-shapes` keeps the op_name keys that still exist upstream and syncs the core_shapes keys. Keys of renamed ops move to `shape/<name>.unmatched.yaml`: map them to the new name (`grep -rn 'op_name=' $FLAGGEMS_DIR/benchmark/test_<op>.py`), move them back and delete the file.
 3. Run a full screen. Add confirmed upstream or environment failures to `ops/dismiss.txt` with the reason and date, and now and then rerun the dismissed ops with `--ops-file` to remove those that pass again.

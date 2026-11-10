@@ -36,10 +36,14 @@ from _term_style import tag
 
 _TAG = "[shape-override-plugin]"
 _entries: dict = {}  # top-level yaml key (op_name or class name) -> entry
+_looked_up: set = set()  # keys an op asked for, to spot a set that matches nothing
+_ops_run: set = set()    # op_names that ran, so only those are judged
 
 
 def _yaml_entry(op_name):
     entry = _entries.get(op_name)
+    if entry is not None:
+        _looked_up.add(op_name)
     return entry if isinstance(entry, dict) and entry.get("shapes") else None
 
 
@@ -59,6 +63,7 @@ def _patch_init_user_config(benchmark_cls) -> None:
 
     def init_user_config(self):
         original(self)
+        _ops_run.add(getattr(self, "op_name", None))
         entry = _yaml_entry(getattr(self, "op_name", None))
         if entry is None:
             return
@@ -116,6 +121,23 @@ def _yaml_input_iter(original):
 
 # --- 3. bespoke input construction --------------------------------------------
 
+def _upstream(original, name, builder):
+    """A name the bespoke builder needs from the benchmark module it patches.
+
+    These builders reach into upstream internals (a TestParam dataclass, a helper).
+    When upstream renames or drops one, say which builder broke and on what, instead
+    of a bare KeyError from a globals lookup deep inside an input iterator.
+    """
+    try:
+        return original.__globals__[name]
+    except KeyError:
+        raise RuntimeError(
+            f"{_TAG} {builder}: upstream no longer defines {name!r} in "
+            f"{original.__globals__.get('__name__', '?')}; update _BESPOKE_BUILDERS in "
+            "_shape_override_plugin.py, or drop the yaml entry to keep upstream's shapes"
+        ) from None
+
+
 def _upsample_builder(self, dtype, shapes, original):
     # _cfgs rows are (N, C, Hi, Wi, Ho, Wo, align_corners, label); the yaml
     # carries the 7 numbers.
@@ -124,7 +146,7 @@ def _upsample_builder(self, dtype, shapes, original):
 
 
 def _fused_deepseek_builder(self, dtype, shapes, original):
-    TestParam = original.__globals__["TestParam"]
+    TestParam = _upstream(original, "TestParam", "_fused_deepseek_builder")
     for num_tokens, num_heads, num_tokens_insert, block_size, max_pos, eps in shapes:
         yield from type(self).make_input(TestParam(
             num_tokens=num_tokens, num_heads=num_heads,
@@ -133,7 +155,7 @@ def _fused_deepseek_builder(self, dtype, shapes, original):
 
 
 def _flash_mla_sparse_builder(self, dtype, shapes, original):
-    TestParam = original.__globals__["TestParam"]
+    TestParam = _upstream(original, "TestParam", "_flash_mla_sparse_builder")
     for s_q, s_kv, topk, h_q, d_qk in shapes:
         yield from type(self).make_input_flashmla(TestParam(
             s_q=s_q, s_kv=s_kv, topk=topk, h_q=h_q, d_qk=d_qk,
@@ -211,3 +233,25 @@ def pytest_collection_finish(session):
     print(f"{tag(_TAG)} yaml shapes now override set_shapes(); "
           f"{redirected} hardcoded get_input_iter redirected; bespoke: "
           f"{', '.join(bespoke) or 'none'}", file=sys.stderr, flush=True)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Warn when an op that ran found no entry in the shape file.
+
+    Upstream renames an op_name now and then (fused_marlin_moe_w8a16_fp8 became
+    fused_marlin_moe_w8a16). A set still keyed on the old name matches nothing,
+    upstream falls back to the benchmark's own hardcoded shapes, and the run looks
+    clean -- the numbers are simply for other shapes than the ones asked for. A
+    whole-suite set legitimately holds keys for ops this session did not run, so
+    only the ops that ran are judged.
+    """
+    ran = sorted(n for n in _ops_run if n)
+    if not _entries or not ran:
+        return
+    missed = [n for n in ran if n not in _looked_up]
+    if not missed:
+        return
+    near = sorted(k for k in _entries if any(n[:12] in k or k[:12] in n for n in missed))
+    hint = f" (similar keys present: {', '.join(near[:5])})" if near else ""
+    print(f"{tag(_TAG)} SHAPE_KEYS_UNUSED the shape file has no entry for {', '.join(missed)}"
+          f"{hint} -- these ops ran on their own hardcoded shapes", file=sys.stderr, flush=True)

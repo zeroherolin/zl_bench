@@ -380,6 +380,10 @@ def report(results: List[Result], labels: Dict[str, str], manifest: dict,
         rate = f" ({len(fp) / len(decided):.2%} of the {len(decided)} decided)" if decided else ""
         print(f"== controls (identical binaries): {len(controls)}; called faster/slower: "
               f"{len(fp)}{rate}, undecided {len(controls) - len(decided)}")
+        if fp:
+            print("   a control only controls when both sides also ran the same tuning "
+                  "config; under independently tuned records some of these are real "
+                  "differences between two configs, not false positives")
         for r in fp[:10]:
             print(f"    false positive: {labels.get(r.row.run, r.row.run)} {r.row.op_name} "
                   f"{r.row.dtype} #{r.row.row} {_pct(r.stats.gap)} p={r.stats.p:.2g}")
@@ -387,7 +391,7 @@ def report(results: List[Result], labels: Dict[str, str], manifest: dict,
 
 def write_csv(path: Path, results: List[Result], labels: Dict[str, str]) -> None:
     fields = ["op", "run", "op_name", "dtype", "row", "size_detail", "gate", "rounds",
-              "median_a_ms", "median_b_ms", "gap", "p", "verdict", "flags", "confirm",
+              "median_a_ms", "median_b_ms", "gap", "p", "p_paired", "verdict", "flags", "confirm",
               "confirm_rounds", "confirm_gap", "confirm_p"]
     with path.open("w", newline="") as f:
         w = csv.writer(f)
@@ -398,7 +402,9 @@ def write_csv(path: Path, results: List[Result], labels: Dict[str, str]) -> None
             w.writerow([labels.get(r.row.run, r.row.run), r.row.run, r.row.op_name, r.row.dtype,
                         r.row.row, r.row.size, r.gate, r.stats.n_a, f"{r.stats.median_a:.6g}",
                         f"{r.stats.median_b:.6g}", f"{r.stats.gap:.6f}",
-                        "" if math.isnan(r.stats.p) else f"{r.stats.p:.4g}", r.stats.verdict, flags,
+                        "" if math.isnan(r.stats.p) else f"{r.stats.p:.4g}",
+                    "" if math.isnan(r.stats.p_paired) else f"{r.stats.p_paired:.4g}",
+                    r.stats.verdict, flags,
                         r.confirm, r.new.n_a if r.new else "",
                         f"{r.new.gap:.6f}" if r.new else "", f"{r.new.p:.4g}" if r.new else ""])
 
@@ -412,13 +418,17 @@ def rule_args(p: argparse.ArgumentParser) -> None:
                    help="smallest |gap| that counts as a difference (default %(default)s)")
     g.add_argument("--alpha", type=float, default=ab_stats.ALPHA,
                    help="Mann-Whitney p below which a gap is real (default %(default)s)")
+    g.add_argument("--alpha-paired", type=float, default=ab_stats.ALPHA_PAIRED,
+                  help="sign-test level over the paired rounds: a row the unpaired test "
+                   "leaves undecided is decided when every round agrees and the gap "
+                   "clears --threshold (default %(default)s)")
     g.add_argument("--clear", type=float, default=ab_stats.CLEAR,
                    help="p at or above which a row is called same (default %(default)s)")
 
 
 def rule_of(args: argparse.Namespace) -> dict:
     return {"min_rounds": args.min_rounds, "threshold": args.threshold, "alpha": args.alpha,
-            "clear": args.clear}
+            "clear": args.clear, "alpha_paired": args.alpha_paired}
 
 
 def main() -> None:
