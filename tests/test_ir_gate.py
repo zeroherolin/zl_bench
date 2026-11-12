@@ -48,6 +48,16 @@ def test_collect_dedups_by_cache_hash_and_labels_batch_ops(tmp_path):
     assert all(v.recorded and v.recorded.name == "w4s3.ttgir" for v in items)
 
 
+def test_a_single_op_record_is_labelled_by_its_spec(tmp_path):
+    # changed_ops.txt and all_ops.txt are --ops-file input: the op, not the dir name
+    run = _run_dir(tmp_path / "softmax_20261110-120000", [("H1", "softmax_kernel", 1)])
+    assert ir_gate.run_dirs([run])[0].label == "softmax_20261110-120000"  # a record without the line
+    log = ">>> op=softmax  mode=record  USE_FLAGTUNE=0\n>>> spec=vllm:softmax@FLA/softmax\n>>> out=x\n"
+    (run / "run.log").write_text(log)
+    (rd,) = ir_gate.run_dirs([run])
+    assert (rd.label, rd.run) == ("vllm:softmax@FLA/softmax", "")
+
+
 def test_collect_single_run_dir(tmp_path):
     run = _run_dir(tmp_path / "softmax_run", [("H1", "softmax_kernel", 1)])
     (item,) = ir_gate.collect([run])
@@ -66,10 +76,46 @@ def test_compare_finds_the_first_differing_stage():
     # same TTGIR, different binary: only the cubin gate sees it
     assert ir_gate.compare(base, _digest(cubin="c2"), "cubin") == ("1", "cubin", "same")
     assert ir_gate.compare(base, _digest(cubin="c2"), "ttgir") == ("0", "-", "same")
-    assert ir_gate.compare(base, _digest(ttgir="t2"), "cubin") == ("1", "ttgir", "order")
-    assert ir_gate.compare(base, _digest(ttgir="t2", norm="n2"), "cubin") == ("1", "ttgir", "changed")
+    # a reordered TTGIR that ends in the same binary measures the same: a control
+    assert ir_gate.compare(base, _digest(ttgir="t2"), "cubin") == ("0", "(ttgir)", "order")
+    assert ir_gate.compare(base, _digest(ttgir="t2"), "ttgir") == ("1", "ttgir", "order")
+    other = _digest(ttgir="t2", norm="n2", cubin="c2")
+    assert ir_gate.compare(base, other, "cubin") == ("1", "ttgir", "changed")
     assert ir_gate.compare(base, _digest(shared=1024), "cubin") == ("1", "meta", "same")
+    assert ir_gate.compare(base, _digest(ttgir="t2", shared=1024), "cubin") == ("1", "ttgir", "order")
     assert ir_gate.compare(base, None, "cubin") == ("?", "error", "?")
+
+
+def _row(kernels, row="0"):
+    return {"op_name": "mm", "dtype": "torch.float16", "row": row, "shape": "4x4", "kernels": kernels}
+
+
+def test_judge_rows():
+    status = {"H0": ("0", "-", "same"), "H1": ("1", "cubin", "same"), "HX": ("?", "error", "?")}
+    rows = [_row("H0"), _row("H0,H1", "1"), _row("H0,HX", "2"), _row("?", "3"), _row("H0,NEW", "4")]
+    judged = ir_gate.judge_rows(rows, status, {"H0", "H1", "HX"})
+    assert [(flag, which) for _, flag, which in judged] == [
+        ("0", ""), ("1", "H1"), ("?", "HX"), ("?", ""), ("?", "NEW")]
+
+
+def test_a_row_without_kernels_is_cleared_only_if_no_variant_is_unaccounted_for():
+    status = {"H0": ("0", "-", "same"), "H1": ("1", "cubin", "same")}
+    rows = [_row("H0"), _row("", "1")]
+    # every variant the run used is in some row: the empty row launches no kernel
+    assert [f for _, f, _ in ir_gate.judge_rows(rows, status, {"H0"})] == ["0", "0"]
+    # the run used a variant no row claims (H1, changed): the empty row may have run it
+    assert [f for _, f, _ in ir_gate.judge_rows(rows, status, {"H0", "H1"})] == ["0", "?"]
+
+
+def test_a_cut_off_line_of_rows_tsv_does_not_break_the_gate(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "rows.tsv").write_text(
+        "op_name\tdtype\trow\tshape\tkernels\nmm\ttorch.float16\t0\t4x4\tH0\nmm\ttorch.fl")
+    rows = ir_gate.read_rows(run)
+    assert len(rows) == 2
+    judged = ir_gate.judge_rows(rows, {"H0": ("0", "-", "same")}, {"H0"})
+    assert [(r["row"], flag) for r, flag, _ in judged] == [("0", "0")]
 
 
 def test_run_dirs_and_rows(tmp_path):
@@ -82,6 +128,25 @@ def test_run_dirs_and_rows(tmp_path):
     assert ir_gate.run_hashes(rd.path) == {"H1"}
     assert ir_gate.read_rows(rd.path)[0]["kernels"] == "H1"
     assert ir_gate.read_rows(tmp_path) is None
+
+
+def test_option_drift():
+    # The record was made by a build without the pipeline_* options; the new build has
+    # them. An operator library may set them where they exist, so the new side may
+    # launch variants the record does not hold.
+    old = {"options": ["num_stages", "num_warps"], "unrecorded_options": []}
+    new = {"options": ["num_stages", "num_warps", "pipeline_merge_loads"],
+               "unrecorded_options": ["pipeline_merge_loads"]}
+    assert ir_gate.option_drift([old, old], [new, None]) == ["pipeline_merge_loads"]
+    assert ir_gate.option_drift([old], [old]) == []
+    # both builds have the option but the record was made without it
+    assert ir_gate.option_drift([new], [new]) == ["pipeline_merge_loads"]
+    # recorded with the newer build: nothing unrecorded, but the older side lacks it
+    recorded_new = dict(new, unrecorded_options=[])
+    assert ir_gate.option_drift([old], [recorded_new]) == ["pipeline_merge_loads"]
+    # no --base (the recorded ttgir is the baseline) and failed compiles are no evidence
+    assert ir_gate.option_drift([], [recorded_new]) == []
+    assert ir_gate.option_drift([None], [None]) == []
 
 
 def test_op_counts_and_diff():

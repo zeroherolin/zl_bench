@@ -13,8 +13,10 @@ Triton cache dir:
 2. Shape tracking — publishes the benchmark shape currently being fed, e.g.
    "16x256x7168x2048x8". Upstream has two input paths, both wrapped (after
    _shape_override_plugin has done its patching): the legacy get_input_iter
-   generator, and the Case API (Benchmark.supports_cases() -> get_case_iter +
-   build_inputs per case), whose label comes from the case's shape dict.
+   generator, labelled by the shape its walk over self.shapes is at
+   (_shape_scope; "input<i>" for an iterator that walks no shapes), and the
+   Case API (Benchmark.supports_cases() -> get_case_iter + build_inputs per
+   case), whose label comes from the case's shape dict.
 3. Launch tracking — kernel_load_end_hook maps a loaded function handle to its
    cache dir (must be the END hook: at load-start the handle is still None);
    launch_enter_hook counts launches per (kernel cache dir, current shape).
@@ -23,13 +25,15 @@ Triton cache dir:
    OUTSIDE the sweep.
 4. Row tracking — every result-table row (a BenchmarkMetrics) gets the
    kernels its measurement ran: launched outside the sweep, inside the timed
-   function (_timing_scope), between the row's creation and the next input.
-   Input construction and the timing harness's own launches are not counted.
-   A benchmark that times without triton.testing.do_bench leaves the timed
-   set empty; its rows get every launch made while they were current
-   (scope "row" instead of "timed"). Written to rows.tsv in table order, one
-   line per table row, so row i of a table in run.log maps to its kernels
-   (ir_gate.py).
+   function (_timing_scope), for the row's input. The row is usually created
+   before its measurement; one created after it takes what its input
+   launched until then. Input construction and the timing harness's own
+   launches are not counted. A benchmark that times without
+   triton.testing.do_bench leaves the timed set empty; its rows get every
+   launch made for their input (scope "row" instead of "timed"). Written to
+   rows.tsv in table order, one line per table row, with the fingerprints of
+   the kernels' binaries (_binary_id), so row i of a table in run.log maps
+   to its kernels (ir_gate.py) and to what they are (ab_compare.py).
 5. Dump at exit — walks TRITON_CACHE_DIR and, for each used variant, writes
        ttgir/<shape>/<kernel>/<distinguishing constexprs>_w{warps}s{stages}.ttgir
    once per shape that used it, and
@@ -40,8 +44,8 @@ Triton cache dir:
    (dtype sweeps, e.g. __fp16), then varying per-arg specializations (e.g.
    __EMdiv16), then a cache-hash prefix. ttgir/index.tsv lists every compiled
    variant per shape with launch counts and cache hash, including never-used
-   sweep losers (index only, no files). atexit (not sessionfinish) so a mid-run
-   CUDA crash still dumps whatever was compiled.
+   sweep losers (index only, no files). atexit (not sessionfinish) so a run
+   whose session ends in a CUDA error still dumps whatever was compiled.
 """
 
 from __future__ import annotations
@@ -56,6 +60,8 @@ from collections import defaultdict
 
 import pytest
 
+import _binary_id
+import _shape_scope
 import _timing_scope
 from _fg_benchmark import benchmark_classes
 from _term_style import DIM, paint, tag
@@ -68,9 +74,15 @@ _fn_to_cachedir: dict = {}   # GPU function handle -> cache-dir basename
 _launches: dict = {}         # cache-dir basename -> {shape label: [real, sweep]}
 _in_bench = 0                # >0 while inside Autotuner._bench (autotune sweep)
 _current_shape: str | None = None
+_walk_label: str | None = None  # label of the shape the input iterator is at (_on_shape)
+_input_label = "input0"      # label of the input being fed when the iterator walks no shapes
 _current_row: int | None = None  # id of the result row being measured
 _row_timed: dict = defaultdict(set)  # row id -> cache-dir basenames launched in the timed function
 _row_any: dict = defaultdict(set)    # row id -> every cache-dir basename launched while it was current
+# row id -> launched for its input outside a timed function, before the row existed
+_row_before: dict = {}
+# launched since the last input with no row current, keyed by "in the timed function"
+_unclaimed: dict = {True: set(), False: set()}
 _row_count = 0
 _tables: list = []           # [(op_name, dtype, [(row id, shape label)])] in print order
 _dump_enabled = False
@@ -164,10 +176,17 @@ def _launch_hook(md):
         rec = _launches.setdefault(cachedir, {}).setdefault(
             _current_shape or "shape_unknown", [0, 0])
         rec[1 if _in_bench else 0] += 1
-        if not _in_bench and _current_row is not None:
+        if _in_bench:
+            return
+        timed = _timing_scope.in_measurement()
+        if _current_row is not None:
             _row_any[_current_row].add(cachedir)
-            if _timing_scope.in_measurement():
+            if timed:
                 _row_timed[_current_row].add(cachedir)
+        else:
+            # No row yet: a benchmark may time first and make its row afterwards
+            # (_wrap_metrics_init hands these to it).
+            _unclaimed[timed].add(cachedir)
     except Exception:
         pass
 
@@ -197,17 +216,61 @@ def _fit(label):
     return label[:_MAX_LABEL - len(digest) - 1] + "_" + digest
 
 
+def _label_part(value):
+    # A nested shape, e.g. [input_shape, output_size], joins its inner dims with "-":
+    # [[2, 256, 14], [2, 14]] reads 2-256-14x2-14 instead of running into 225614x214,
+    # which is also what [[22, 56, 14], [21, 4]] would give.
+    if isinstance(value, (list, tuple)):
+        return "-".join(_label_part(v) for v in value)
+    return re.sub(r"\W", "", str(value))
+
+
 def _label_of(shape):
     if isinstance(shape, (list, tuple)):
-        return _fit("x".join(re.sub(r"\W", "", str(v)) for v in shape))
-    return _fit(re.sub(r"\W", "", str(shape)))
+        return _fit("x".join(_label_part(v) for v in shape))
+    return _fit(_label_part(shape))
 
 
-def _shape_label(bench, idx):
-    shapes = getattr(bench, "shapes", None) or []
-    if idx < len(shapes):
-        return _label_of(shapes[idx])
-    return f"input{idx}"
+class _WalkedList(list):
+    """Benchmark.shapes while its get_input_iter runs: iterating it tells _on_shape
+    which shape the iterator is at (_shape_scope.walk)."""
+
+    def __iter__(self):
+        return _shape_scope.walk(list.__iter__(self))
+
+
+class _WalkedTuple(tuple):
+    def __iter__(self):
+        return _shape_scope.walk(tuple.__iter__(self))
+
+
+_WALKED = {list: _WalkedList, tuple: _WalkedTuple}
+
+
+def _new_input():
+    """An input begins (or a row took what was launched for it so far)."""
+    for kernels in _unclaimed.values():
+        kernels.clear()
+
+
+def _between_rows():
+    """No row is being measured: a table was printed, or a test begins. A benchmark that
+    feeds itself, without get_input_iter or build_inputs, has no other boundary between
+    its rows; without one the kernels of its next row would go to the last."""
+    global _current_row
+    _current_row = None
+    _new_input()
+
+
+def pytest_runtest_setup(item):
+    _between_rows()
+
+
+def _on_shape(shape):
+    """The input iterator reached `shape`; None: it walked all its shapes."""
+    global _walk_label, _current_shape
+    _walk_label = _label_of(shape) if shape is not None else None
+    _current_shape = _walk_label or _input_label
 
 
 def _case_label(case):
@@ -227,22 +290,43 @@ def _case_label(case):
 
 
 def _wrap_input_iter(original):
-    # Publish the shape label BEFORE resuming the generator, so kernels
-    # launched while building the inputs attribute to the right shape too.
+    """get_input_iter, publishing the label of each input it yields.
+
+    The label is the shape the iterator is at in its walk over self.shapes (or over the
+    yaml shapes, for an iterator _shape_override_plugin redirected): right also when a
+    shape yields several inputs, which counting the inputs would not be. An iterator
+    that walks no shapes (a hardcoded list of cases), or that has walked them all before
+    its first input, gets input<i> for its i-th input: it says nothing about a shape,
+    which is better than naming the wrong one.
+    """
     def patched(self, dtype):
-        global _current_shape, _current_row
+        global _current_shape, _current_row, _walk_label, _input_label
+        shapes = getattr(self, "shapes", None)
+        walked = _WALKED.get(type(shapes))
+        if walked is not None:
+            self.shapes = walked(shapes)
+        _walk_label = None
         it = original(self, dtype)
         idx = 0
-        while True:
-            _current_shape = _shape_label(self, idx)
-            _current_row = None
-            try:
-                item = next(it)
-            except StopIteration:
-                _current_shape = None
-                return
-            yield item
-            idx += 1
+        try:
+            while True:
+                # Published before the generator resumes, and updated by _on_shape as
+                # it moves on, so kernels launched while the inputs are built belong
+                # to the right shape too.
+                _input_label = f"input{idx}"
+                _current_shape = _walk_label or _input_label
+                _current_row = None
+                _new_input()
+                try:
+                    item = next(it)
+                except StopIteration:
+                    _current_shape = _walk_label = None
+                    return
+                yield item
+                idx += 1
+        finally:
+            if walked is not None and type(getattr(self, "shapes", None)) is walked:
+                self.shapes = shapes
     return patched
 
 
@@ -253,6 +337,7 @@ def _wrap_build_inputs(original):
         global _current_shape, _current_row
         _current_shape = _case_label(case)
         _current_row = None
+        _new_input()
         return original(self, case)
     return patched
 
@@ -265,7 +350,17 @@ def _wrap_metrics_init(original):
         original(self, *args, **kwargs)
         self._zl_row = _row_count
         self._zl_shape = _current_shape or "shape_unknown"
-        _current_row = _row_count
+        # What this input launched before the row existed. Most benchmarks make the
+        # row and then measure; one that measures first would otherwise have a row
+        # without kernels, which a gate takes for a row no compiler change can touch.
+        measured = bool(_unclaimed[True])
+        if measured:
+            _row_timed[_row_count] |= _unclaimed[True]
+        _row_before[_row_count] = set(_unclaimed[False])
+        _new_input()
+        # A row whose measurement came first is complete: what is launched from here
+        # on belongs to the next one.
+        _current_row = None if measured else _row_count
         _row_count += 1
     return patched
 
@@ -279,6 +374,7 @@ def _wrap_result_str(original):
             _tables.append((str(self.op_name), str(self.dtype).strip(),
                             [(getattr(m, "_zl_row", None), getattr(m, "_zl_shape", "shape_unknown"))
                              for m in (self.result or [])]))
+            _between_rows()  # its rows are complete: what is launched next is not theirs
         return original(self)
     return patched
 
@@ -434,12 +530,19 @@ def _dump_ir_guarded(cache_dir: str, run_dir: str) -> None:
     gate or an A/B has nothing to attribute rows to.
     """
     import pathlib
+    import shutil
+
+    # The run dir may hold the dump of an earlier attempt (run_batch.py retries into the
+    # same dir, e.g. without the dtype filter). Its files would sit next to this
+    # attempt's as if this run had used those variants too.
+    for name in ("ttgir", "ttir"):
+        shutil.rmtree(pathlib.Path(run_dir) / name, ignore_errors=True)
 
     # rows.tsv first and on its own: it is what attributes result rows to kernels,
     # and it costs nothing, so a failure in the much larger IR copy below must not
     # take it down with it.
     try:
-        _write_rows(pathlib.Path(run_dir) / "rows.tsv")
+        _write_rows(pathlib.Path(run_dir) / "rows.tsv", cache_dir)
     except Exception:
         import traceback
 
@@ -451,9 +554,9 @@ def _dump_ir_guarded(cache_dir: str, run_dir: str) -> None:
     except Exception:
         import traceback
 
-        print(f"{tag(_TAG)} IR_DUMP_FAILED {run_dir}: the run's numbers are fine, but it has "
-              "no ttgir/ttir/rows.tsv, so ir_gate.py and --gate cannot attribute its rows",
-              file=sys.stderr, flush=True)
+        print(f"{tag(_TAG)} IR_DUMP_FAILED {run_dir}: the run's numbers are fine, but its "
+              "ttgir/ and ttir/ are missing or incomplete, so ir_gate.py cannot recompile "
+              "its kernels and --gate counts its rows as unknown", file=sys.stderr, flush=True)
         traceback.print_exc()
 
 
@@ -562,24 +665,66 @@ def _dump_ir(cache_dir: str, run_dir: str) -> None:
           + ")", flush=True)
 
 
-def _write_rows(path) -> None:
+def _fingerprint(cache_dir, name: str) -> str:
+    """What a launch of the variant in <cache_dir>/<name> runs (_binary_id.fingerprint):
+    kernel name, the cubin's code and the launch metadata. "?" when the cache does not
+    hold them (another backend, a cache that was cleared)."""
+    import pathlib
+
+    try:
+        (cubin,) = (pathlib.Path(cache_dir) / name).glob("*.cubin")
+        meta = json.loads(cubin.with_suffix(".json").read_text())
+        return _binary_id.fingerprint(cubin.stem, cubin.read_bytes(), meta)
+    except Exception:
+        return "?"
+
+
+def _write_rows(path, cache_dir=None) -> None:
     """rows.tsv: one line per result-table row, numbered per (op_name, dtype) as
     the rows appear in run.log, with the cache hashes of the kernels it ran
-    ("?" for a row that was not tracked) and where they came from (scope)."""
+    ("?" for a row that was not tracked), where they came from (scope) and, in the
+    same order, the fingerprints of their binaries (ab_compare.py compares those
+    between the two sides of an A/B; "-" for a row that launched no kernel).
+
+    scope "timed": launched in the timed function. "row": nothing was launched in a
+    timed function for this row (the benchmark times without triton.testing.do_bench,
+    or _cudagraph_plugin is not loaded), so every launch made while it was current
+    counts, or failing that every launch made for its input before the row existed.
+
+    The one flow this cannot follow is a benchmark that makes several rows in one test
+    without get_input_iter or build_inputs and times each with a timer of its own
+    before making the row: nothing marks where one row's launches end, and they go to
+    the row before. Upstream has no such benchmark."""
     seq: dict = defaultdict(int)
+    prints: dict = {}
+
+    def binaries(names) -> str:
+        if cache_dir is None:
+            return ""
+        if names is None:
+            return "?"
+        if not names:
+            return "-"
+        for name in names:
+            if name not in prints:
+                prints[name] = _fingerprint(cache_dir, name)
+        return ",".join(prints[name] for name in names)
+
     with open(path, "w") as f:
-        f.write("op_name\tdtype\trow\tshape\tkernels\tscope\n")
+        f.write("op_name\tdtype\trow\tshape\tkernels\tscope\tbinaries\n")
         for op_name, dtype, rows in _tables:
             for row_id, shape in rows:
                 i = seq[(op_name, dtype)]
                 seq[(op_name, dtype)] += 1
                 if row_id is None:
-                    kernels, scope = "?", "-"
+                    names, kernels, scope = None, "?", "-"
                 elif _row_timed.get(row_id):
-                    kernels, scope = ",".join(sorted(_row_timed[row_id])), "timed"
+                    names, scope = sorted(_row_timed[row_id]), "timed"
+                    kernels = ",".join(names)
                 else:
-                    kernels, scope = ",".join(sorted(_row_any.get(row_id, ()))), "row"
-                f.write(f"{op_name}\t{dtype}\t{i}\t{shape}\t{kernels}\t{scope}\n")
+                    names, scope = sorted(_row_any.get(row_id) or _row_before.get(row_id, ())), "row"
+                    kernels = ",".join(names)
+                f.write(f"{op_name}\t{dtype}\t{i}\t{shape}\t{kernels}\t{scope}\t{binaries(names)}\n")
 
 
 # --- registration -----------------------------------------------------------
@@ -606,6 +751,7 @@ def pytest_configure(config):
             prev(**kwargs)
             _compile_listener(**kwargs)
         triton.knobs.compilation.listener = chained
+    _shape_scope.listener = _on_shape
     triton.knobs.runtime.kernel_load_end_hook.add(_load_hook)
     triton.knobs.runtime.launch_enter_hook.add(_launch_hook)
     _autotuner.Autotuner._bench = _wrap_bench(_autotuner.Autotuner._bench)
