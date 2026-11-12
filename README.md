@@ -38,8 +38,8 @@ zl_bench is a set of pytest plugins and driver scripts for the benchmark suites 
 - **Low-noise timing.** Kernels are timed with CUDA graphs after an explicit warmup, keeping launch overhead and first-call compilation out of the numbers. Calls that cannot be captured, such as ones that synchronize with the host, fall back to `do_bench` and are marked in the log.
 - **IR for every measurement.** Each run keeps the ttgir it actually used, per shape and with readable names, the ttir and compile options for offline recompilation, and which kernels each result row ran.
 - **Compile-diff gate.** Recompile the recorded ttir with two compiler builds down to cubin and A/B only the result rows whose kernels changed: one to two orders of magnitude faster than a full run.
-- **Statistical A/B.** Both sides run interleaved on one GPU over repeated rounds; each row gets a rank-test verdict, undecided rows get more rounds, and rows whose binary did not change serve as controls that measure the false-positive rate.
-- **Batch screening.** Run the 1600+ benchmarks of both repos across GPUs, with timeouts, retries, resume and a per-row summary.
+- **Statistical A/B.** Both sides run interleaved on one GPU over repeated rounds; each row gets a verdict from a rank test and a sign test over the paired rounds, undecided rows get more rounds, and rows whose binary did not change serve as controls that measure the false-positive rate.
+- **Batch screening.** Run the 1800+ benchmarks of both repos across GPUs, with timeouts, retries, resume and a per-row summary.
 - **Authoritative shapes.** One yaml decides the shapes of every op, including benchmarks that hardcode theirs.
 
 How it works: [docs/design.md](docs/design.md).
@@ -54,7 +54,7 @@ zl_bench patches upstream internals, so it is tied to the upstream versions it w
 | FlagGems-vllm | [`a579b7c`](https://github.com/flagos-ai/FlagGems-vllm/commit/a579b7c) | 2026-11-10 | `flagos-ai/FlagGems-vllm` main |
 | FlagTree | [`6d7597f66`](https://github.com/flagos-ai/FlagTree/commit/6d7597f66) | 2026-11-10 | `flagos-ai/FlagTree` main |
 
-Environment: NVIDIA H20 (Hopper, driver 595.45), CUDA 13.0, PyTorch 2.11.0, Python 3.12, vLLM 0.20.2. With other upstream versions, rebuild the inventory and refresh the shape sets first ([Keeping up with upstream](#keeping-up-with-upstream)); each `run.log` records the Triton path and git revision it ran with.
+Environment: NVIDIA H20 (Hopper, driver 570.158.01), CUDA 13.0, PyTorch 2.11.0, Python 3.12, vLLM 0.20.2. With other upstream versions, rebuild the inventory and refresh the shape sets first ([Keeping up with upstream](#keeping-up-with-upstream)); each `run.log` records the Triton path and the git revisions of the compiler and the operator repo it ran with.
 
 ## Requirements
 
@@ -117,7 +117,7 @@ FLAGGEMS_DIR=../FlagGems-vllm OP=fused_marlin_moe_w4a16_mxfp4 \
 SHAPE_FILE=shape/DeepSeek-V4-Flash-p32768d1024.yaml bash run_pytest.sh   # another shape set
 ```
 
-Both repos have ops with the same name but different implementations; `FLAGGEMS_DIR` decides which one runs. Measurement is always one process on one GPU, which is what makes timings comparable; pick the GPU with `CUDA_VISIBLE_DEVICES`. The top of `run.log` records the triton path and git revision and the `FLAGTREE_*`/`TRITON_*`/`MLIR_*` variables, so the two sides of an A/B can be reconciled.
+Both repos have ops with the same name but different implementations; `FLAGGEMS_DIR` decides which one runs. Measurement is always one process on one GPU, which is what makes timings comparable; pick the GPU with `CUDA_VISIBLE_DEVICES`. The top of `run.log` records the triton path, the git revisions of the compiler and of the operator repo (`-dirty` when tracked files are modified) and the `FLAGTREE_*`/`TRITON_*`/`MLIR_*` variables, so the two sides of an A/B can be reconciled.
 
 ### A/B comparison
 
@@ -140,7 +140,7 @@ This single comparison is a quick look. GPUs of one box differ systematically by
 - Point `REPLAY_FROM` at the original record: replay runs write no `autotune_records/`.
 - For IR differences, diff `ttgir/<shape>/<kernel>/` of the two runs.
 
-**Read the markers in `run.log`.** `AUTOTUNE_REPLAY_FALLBACK` means a recorded config was missing or failed to compile and that point was tuned live, so it no longer uses A's config (`ab_compare.py` flags such ops `[replay_fallback]`); with the `_no_evict` suffix the retry reused the bad config, so treat the point as unverified. `BENCHMARK_DIRECT_NO_CUDAGRAPH` marks points timed with plain `do_bench` because the call cannot be graph captured (`phase=host_sync`: it synchronizes with the host); both sides fall back alike, but those numbers are noisier, especially for sub-millisecond kernels ([details](docs/design.md#timing)).
+**Read the markers in `run.log`.** `AUTOTUNE_REPLAY_FALLBACK` means a recorded config was missing or failed to compile and that point was tuned live, so it no longer uses A's config (`ab_compare.py` flags such ops `[replay_fallback]`). The reason says what was missing: the whole record (`record_missing`), every config of a kernel (`kernel_missing`, printed once per kernel) or one key (`key_missing`); with the `_no_evict` suffix the retry reused the bad config, so treat the point as unverified. `BENCHMARK_DIRECT_NO_CUDAGRAPH` marks points timed with plain `do_bench` because the call cannot be graph captured (`phase=host_sync`: it synchronizes with the host); both sides fall back alike, but those numbers are noisier, especially for sub-millisecond kernels ([details](docs/design.md#timing)).
 
 ### Repeated-measures A/B
 
@@ -154,15 +154,15 @@ python ab_run.py --record runs/<record> --ops softmax mm \
 python ab_compare.py runs/ab_dev -v --csv runs/ab_dev/rows.csv
 ```
 
-- Each (op, round) runs A and B back to back on one GPU, A first in odd rounds and B first in even ones, so per-GPU bias and slow drift cancel. Items share one queue over all GPUs, longest first; every run is a fresh process, so rounds are independent samples. Each run gets the same handling as in a [batch](#batch-runs) (timeout, retries, idle-GPU check). `<out>/r<k>_a` and `r<k>_b` are laid out like batch dirs; rerunning with the same `--out` resumes.
-- Verdict per row ([details](docs/design.md#statistics)): `faster` / `slower` when the medians differ by more than `--threshold` (0.5%) and a two-sided Mann-Whitney test gives p < `--alpha` (0.01) over at least `--min-rounds` (6) rounds; `same` within the threshold or at p ≥ `--clear` (0.1); otherwise `undecided`. `--until-decided` adds `--step` rounds to ops with undecided rows up to `--max-rounds` (14). A row left `undecided` is decided on the pairing when every round points the same way and the gap clears `--threshold`: the rounds run both sides back to back on one GPU, so a pair cancels the GPU and the drift the unpaired test must absorb (six agreeing pairs are a two-sided sign test at p = 0.031, `--alpha-paired`; the unpaired test over 6 vs 6 samples needs them to separate completely). The CSV carries `p_paired`.
+- Each (op, round) runs A and B back to back on one GPU, A first in odd rounds and B first in even ones, so per-GPU bias and slow drift cancel. Items share one queue over all GPUs, longest first; every run is a fresh process, so rounds are independent samples. Each run gets the same handling as in a [batch](#batch-runs) (timeout, retries, idle-GPU check). `<out>/r<k>_a` and `r<k>_b` are laid out like batch dirs. Rerunning with the same `--out` and the same sides, record, `--dtypes` and `--shape-file` resumes: rounds that passed on both sides are kept, and a round with a failed or missing side is rerun on both, so that its two sides stay a pair on one GPU. Ctrl-C (or SIGTERM, or a closed terminal) stops the runs under way, exits with 130 and leaves the dir resumable; the round that was cut short counts for nothing until it is rerun.
+- Verdict per row ([details](docs/design.md#statistics)), given at least `--min-rounds` (6) rounds: `faster` / `slower` when the medians differ by more than `--threshold` (0.5%) and one of two tests shows the difference: the two-sided Mann-Whitney test at p < `--alpha` (0.01), or the pairing, when every round points the same way and the sign test over the rounds is below `--alpha-paired` (0.05; six agreeing rounds are p = 0.031). `same` within the threshold, or at p ≥ `--clear` (0.1) when the pairing shows nothing; otherwise `undecided`. The two tests face different noise. The rank test pools the rounds, so the few percent between GPUs count against it: a 2% effect present in every round can sit at p = 0.2. The two sides of a round share a GPU, so a pair cancels it. The CSV carries `p`, `p_paired` and, for a faster/slower row, the test that showed it (`basis`: `rank` or `pairing`). `--until-decided` adds `--step` rounds to ops with undecided rows up to `--max-rounds` (14).
 - `gap = median(A) / median(B) − 1`, positive when B is faster. It is the effect of the compiler change under the record's configs, not of each side at its own best ([why](docs/design.md#each-side-at-its-best)).
-- With `--gate <ir_gate out>` (next section), rows whose kernels compiled to the same binary on both sides are controls: they cannot differ, so `ab_compare.py` reports how many of them the rule calls faster or slower, the measured false-positive rate.
-- **Recheck weak results on fresh rounds.** A row with a small or noisy gap was selected and judged on the same samples, which overstates it. `ab_compare.py --recheck-list` writes the ops with such rows (|gap| < 2%, |gap| < 2× the samples' coefficient of variation, or do_bench timing); `ab_run.py --add-rounds 6` gives them new rounds numbered after the existing ones; `ab_compare.py --confirm <first>-<last>` (the range `ab_run.py` prints) judges every row on the other rounds and keeps a faster/slower row only if the new rounds alone reproduce it (one-sided, p < 0.05):
+- With `--gate <ir_gate out>` (next section), rows whose kernels compiled to the same binary on both sides are controls: they cannot differ, so `ab_compare.py` reports how many of them the rule calls faster or slower, the measured false-positive rate. A row the gate cleared is a control only if both sides also launched the same binaries in every round, which each run records; if they differ the row is **diverged** and counts as a result, and if a run could not tell, or had an `AUTOTUNE_REPLAY_FALLBACK` and recorded no binaries, it is unknown: the gate compared the recorded configs, not what such a run launched.
+- **Recheck weak results on fresh rounds.** A row with a small or noisy gap was selected and judged on the same samples, which overstates it. `ab_compare.py --recheck-list` writes the ops with such rows (|gap| < 2%, |gap| < 2× the samples' coefficient of variation, do_bench timing, a round in which a side failed after measuring the row, or a verdict only the pairing shows); `ab_run.py --add-rounds 6` gives them new rounds numbered after the existing ones; `ab_compare.py --confirm <first>-<last>` (the range `ab_run.py` prints) judges every row on the other rounds and keeps a faster/slower row only if the new rounds alone reproduce it, one-sided at `--confirm-alpha` (0.05): by the rank test, or by every new round agreeing. A row that is not reproduced becomes `undecided`. Fewer than four new rounds cannot show anything at 0.05, and four that all agree while their samples overlap cannot either (the pairing needs five); such a row is reported as `too_few_rounds` and keeps its verdict, so add at least five. If the added rounds are interrupted or have failures, rerun with `--from-round <first>` (`ab_run.py` prints the command): without it a rerun would start another range after the highest round so far.
 
   ```bash
   python ab_compare.py runs/ab_dev --gate runs/gate_dev --recheck-list runs/ab_dev/recheck.txt
-  python ab_run.py <same sides and record> --out runs/ab_dev --ops-file runs/ab_dev/recheck.txt --add-rounds 6
+  python ab_run.py <same sides, record, --dtypes and --shape-file> --out runs/ab_dev --ops-file runs/ab_dev/recheck.txt --add-rounds 6
   python ab_compare.py runs/ab_dev --gate runs/gate_dev --confirm 15-20 --csv runs/ab_dev/rows.csv
   ```
 
@@ -190,8 +190,9 @@ python ab_compare.py runs/ab_dev --gate runs/gate_dev -v --csv runs/ab_dev/rows.
 ```
 
 - Record on the multi-shape set. Kernel variants depend on the shape; a variant only a second shape uses is invisible in a single-shape record, so the gate can only clear what was recorded.
-- The gate recompiles the variants the measurement used and compares the cubin and the launch metadata (shared memory, warps). Identical means the measured kernel is the same binary, so there is nothing to measure. TTGIR is not enough: instruction order and later stages change the binary without changing the TTGIR ops. `variants.tsv` shows, per variant, the first stage that differs, whether the TTGIR changed, was only reordered or stayed the same, and the TTGIR ops whose count changed. `--stage ttgir` stops at TTGIR for a quicker first look; without `--base` the recorded ttgir is the baseline, which also limits the gate to TTGIR.
-- `rows.tsv` of the gate marks each result row changed if a kernel it ran changed (from the run's own `rows.tsv`), so an op that only changed in one shape's kernel does not turn its other rows into results; those rows become controls. Runs recorded without row tracking are judged per op.
+- The gate recompiles the variants the measurement used and compares the cubin and the launch metadata (shared memory, warps, scratch memory, launch mode). A variant is unchanged if and only if both are identical: the measured kernel is then the same binary, so there is nothing to measure. TTGIR decides neither way: a later stage can change the binary under an unchanged TTGIR, and a reordered TTGIR can end in the same binary. `variants.tsv` shows, per variant, the first stage that differs (in parentheses when the cubin is the same nonetheless), whether the TTGIR changed, was only reordered or stayed the same, and the TTGIR ops whose count changed. `--stage ttgir` stops at TTGIR for a quicker first look, where any TTGIR difference counts as a change; without `--base` the recorded ttgir is the baseline, which also limits the gate to TTGIR.
+- `rows.tsv` of the gate marks each result row changed if a kernel it ran changed (from the run's own `rows.tsv`), so an op that only changed in one shape's kernel does not turn its other rows into results; those rows become controls. A row without kernels is cleared only if the run's rows account for every variant it used; otherwise it is unknown. Runs recorded without row tracking are judged per op. `changed_ops.txt` and `all_ops.txt` name ops the way `--ops` takes them; for a single-op record that needs the `spec=` line a current `run_pytest.sh` logs.
+- What the gate clears is the recorded variants, compiled with the recorded options. Whether an A/B side launched those is checked on the runs themselves: every run records the binaries its rows launched (`rows.tsv`, column `binaries`: the cubin's code and the launch metadata, without line info), and `ab_compare.py --gate` reports a row the gate cleared whose two sides ran different binaries as **diverged**, a result and not a control. That happens when an operator library sets a compile option only where the compiler has it (FlagGems-vllm does so for FlagTree's `pipeline_*` options, per kernel and as one more dimension of a tuning space), and after a replay fallback. `ir_gate.py` warns when a build has compile options the record or the other build lacks. Then replay every recorded op once on both sides (`ab_run.py --ops-file <gate>/all_ops.txt --rounds 1 --gate <gate> ...`), write the ops with diverged rows (`ab_compare.py <ab> --gate <gate> --diverged-list <file>`), and run step 3 on both lists: `cat <gate>/changed_ops.txt <file> > ops.txt`, then `--ops-file ops.txt` (an op named in both is run once).
 - A changed binary does not imply a performance change; step 3 decides. Check SASS before trusting a big swing: ptxas scheduling alone can make the same TTGIR twice as slow on another build (e.g. through different load batching).
 
 ### Batch runs
@@ -214,14 +215,15 @@ python run_batch.py --ops-file my_ops.txt --env FLAGTREE_XXX=1
 ```
 
 - Each op runs in its own process, so a CUDA crash only loses that op, and `<batch>/<repo>/<op>/` has the same layout as a single-op run.
-- `--op-timeout` (default 1800 s) kills a hung op and records `TIMEOUT` without retry. Test failures and signal kills are retried up to twice, stopping as soon as the same exit code repeats.
+- `--op-timeout` (default 1800 s) kills a hung op and records `TIMEOUT` without retry. Test failures and signal kills are retried up to twice, stopping as soon as the same exit code repeats. A retry reuses the op's dir: the earlier attempt's log is kept as `run.attempt<n>.log`, its IR is replaced.
 - With `--dtypes`, an op that rejects the dtype is rerun without the filter (`dtype_fallback`); any other failure without a SUCCESS row gets one last unfiltered run (`dtype_rescue`).
-- Runtime skipif and xfail count as SKIP. Only PASS and SKIP are marked complete for `--resume`.
-- `ops_status.csv` has one row per op (status, time, rows, notes) and is updated as ops finish; `summary.csv` has one row per result row, and `batch_summary.py` rebuilds it for older batches. The notes column counts `no_cudagraph_rows` and `replay_fallback`; read it first.
+- Runtime skipif and xfail count as SKIP. Only PASS and SKIP are marked complete for `--resume`. A test that passes without printing a FlagGems result table (a correctness test, a benchmark with an output format of its own) is a FAIL: there is nothing for the tools to read.
+- `ops_status.csv` has one row per op the batch dir holds (status, GPU, time, rows, notes) and is updated as ops finish; a resumed or later run of the same dir keeps the rows of the ops it does not run again. `summary.csv` has one row per result row, and `batch_summary.py` rebuilds it for older batches. Read the notes column first: it counts `no_cudagraph_rows`, `replay_fallback` and `cudagraph_oom_retry`, and flags `shape_keys_unused` (the op did not measure the shape file's shapes) and `ir_dump_failed`; a PASS with one of these is not the measurement it looks like.
+- Ctrl-C (or SIGTERM, or a closed terminal) stops the runs under way and exits with 130; `--batch-dir <dir> --resume` goes on from there. Under `nohup` the batch survives its terminal as usual.
 - Before an op starts, its GPU must be idle: no process in `nvidia-smi`, and under 1 GiB in use (processes of other containers are not listed). A neighbour on the same GPU skews both timing and tuning, so the batch waits (`--busy-gpu wait`, the default; `warn` measures anyway and notes `gpu_busy`). GPU numbers follow `nvidia-smi` (`CUDA_DEVICE_ORDER=PCI_BUS_ID`).
 - Batch numbers are a screen: GPUs running side by side couple through power and thermals. Confirm suspects with a [repeated-measures A/B](#repeated-measures-ab).
 
-**Reference full run** ([tested versions](#tested-versions), 7×H20, `--dtypes bfloat16`, single-shape set): `--all` selects 1608 ops and takes about 2.5 hours, 12 s per op at the median (mostly process start and imports). PASS 1529, SKIP 43; the other 36 fail for upstream or environment reasons and are listed in `ops/dismiss.txt`. Every SKIP is an upstream skipif (a missing TransformerEngine or vLLM reference, another vendor or architecture). On the multi-shape set (275 ops, `--dtypes "bfloat16 float16"`) an op takes about a minute at the median and up to two hours in record mode (`chunk_gdn2`), so give it `--op-timeout 7200`.
+**Reference full run** ([tested versions](#tested-versions), 7×H20, `--dtypes bfloat16`, single-shape set): `--all` selects 1876 ops and takes 5 h 55 min, 38 GPU-hours in all. PASS 1822, SKIP 54, and all 10241 result rows are SUCCESS. Every SKIP is upstream's: a skipif (a missing TransformerEngine or vLLM reference, another vendor or architecture, a launch that needs several ranks or GPUs) or an xfail. An op takes 46 s at the median (43 s without a retry, 79 s when it is rerun, mostly without the dtype filter), 112 s at the 90th percentile and up to 24 minutes (`convolution_double_backward`). The ops that fail for upstream or environment reasons, or print no FlagGems result table, are listed in `ops/dismiss.txt`. On the multi-shape set an op takes about a minute at the median and up to two hours in record mode (`chunk_gdn2`), so give it `--op-timeout 7200`.
 
 ### Faster sweeps on multiple GPUs
 
@@ -237,7 +239,7 @@ Outputs, replay and the result table are unchanged. Shards running side by side 
 WARNING 1 config key(s) got different winners across shards — parallel interference reached the sweep
 ```
 
-With no conflicts the configs can be trusted; with many, rerun without `PARALLEL_WARMUP_GPUS` before drawing conclusions. The plugin does nothing under `REPLAY_FROM`, with fewer than two visible GPUs, or when the shape set has no entry under the `OP` name ([details](docs/design.md#parallel-sweep)).
+With no conflicts the configs can be trusted; with many, rerun without `PARALLEL_WARMUP_GPUS` before drawing conclusions. The plugin does nothing under `REPLAY_FROM`, with fewer than two visible GPUs, or when no entry of the shape set has two shapes to split (the single-shape set) ([details](docs/design.md#parallel-sweep)).
 
 ## Configuration
 
@@ -279,7 +281,10 @@ softmax:
 | `shape/DeepSeek-V4-Flash-sweep.yaml` | the same MoE config with num_tokens over powers of two |
 
 - Both `all_ops_*` sets include the keys of upstream's `core_shapes.yaml` (the single set keeps one shape of each). `--shape_file` replaces core_shapes rather than extending it, and without class-name keys such as `BlasBenchmark` the BLAS family would fall back to 1-D shapes and fail.
-- Ops without an entry run upstream's default shapes. For ops that hardcode their shapes in `set_shapes()` that means all of them (16 large MoE shapes for marlin), so give new or renamed ops of that kind an entry in both sets.
+- The key is the benchmark's op_name, not the name of the test, and the two repos do not always agree on it: `test_fused_marlin_moe_w8a16_int8` is `fused_marlin_moe_w8a16_int8` in FlagGems and `fused_marlin_moe_w8a16` in FlagGems-vllm. The `op_names` column of `ops/inventory_*.csv` has the key of most tests; where it is empty the op_name is not a literal in the test, so read the benchmark, or the `shapes of ...` line of a run.
+- Where one name means two things, scope the key to a repo: `vllm:<name>` applies to FlagGems-vllm only and beats the plain key there, `main:<name>` likewise for FlagGems. `fused_recurrent_gated_delta_rule` takes a sequence length in FlagGems and a case name in FlagGems-vllm, so the shared sets carry `vllm:fused_recurrent_gated_delta_rule` and no plain key. Upstream knows nothing of scopes: `run_pytest.sh` resolves the set for the repo under test (`shape_set.py`) into the run's `shapes.yaml`, which is also what a replay reuses.
+- Ops without an entry run upstream's default shapes, or those of a class-name key that applies to them. For ops that hardcode their shapes that means all of them (16 large MoE shapes for marlin, minutes instead of seconds), so give new or renamed ops of that kind an entry in both sets. An op whose shapes are not what the generic `Benchmark` key holds needs one too: `hc_combine` reads five-element shapes and fails on the two-dimensional one that key hands it.
+- Every run logs where its shapes came from (`shapes of <op_name>: 1 of the 1 of key '<key>'`), and prints `SHAPE_KEYS_UNUSED` when that cannot be what the shape file meant: no key applies to the op at all, the key sits on the test's name instead of the op_name, or the benchmark has an entry but measures shapes of its own. Falling back to a class-name key is not reported, so in the `all_ops_*` sets, which carry a `Benchmark` key, an op that hardcodes its shapes and has no entry shows only as the log line `shapes of <op_name>: its own N (class key 'Benchmark' not used)`.
 - Benchmarks parameterized by cases that never read shapes (e.g. `scaled_mm_benchmark`) always run their built-in shapes ([details](docs/design.md#shape-override)).
 
 ### Plugins
@@ -294,7 +299,7 @@ runs/softmax_20260716-031752/
 ├── shapes.yaml          # the shape set used
 ├── autotune_records/    # autotune configs chosen in record mode, read by REPLAY_FROM
 │   └── softmax.json
-├── rows.tsv             # per result row: shape and the cache hashes of the kernels it ran
+├── rows.tsv             # per result row: shape, the kernels it ran (cache hashes) and their binaries
 ├── ttgir/               # IR of the variants actually used, per shape
 │   ├── 1024x1024/softmax_kernel_inner/w4s3__bf16.ttgir
 │   ├── index.tsv        # every compiled variant: shape, file, launches, constexprs, cache hash
@@ -305,8 +310,9 @@ runs/softmax_20260716-031752/
 - Only variants used by the measurement are written; sweep losers appear in `index.tsv` only.
 - File names list the constexprs that differ within a (shape, kernel) group, abbreviated (`BLOCK_SIZE_M` → `BSM`), then `w{warps}s{stages}`; ties are broken by dtype, argument specialization or hash ([details](docs/design.md#ir-dump)).
 - Kernels launched outside input construction and measurement, such as module-level probes, go to `shape_unknown/`.
-- `rows.tsv` follows the order of the result tables in `run.log`: row `i` of a table maps to the kernels its measurement launched (scope `timed`), which is how `ir_gate.py` attributes changes to rows. A benchmark that times without `triton.testing.do_bench` gets every kernel launched while the row was being measured (scope `row`).
-- The IR is written at process exit, also after a CUDA crash.
+- `rows.tsv` follows the order of the result tables in `run.log`: row `i` of a table maps to the kernels its measurement launched (scope `timed`), which is how `ir_gate.py` attributes changes to rows. A row for which nothing was launched in a timed function (a benchmark that times without `triton.testing.do_bench`, or a run without `_cudagraph_plugin`) gets every kernel launched for its input (scope `row`). The `shape` column is the shape the benchmark's input iterator was at, or `input<i>` for the i-th input of an iterator that walks no shapes.
+- The `binaries` column of `rows.tsv` identifies what those kernels are as binaries: one fingerprint per kernel over its name, the code of its cubin (debug sections left out) and the launch metadata; `-` for a row that launched no kernel, `?` where the run could not tell. Unlike the cache hash, which differs between any two compiler builds, it is equal when two builds emit the same binary, which is what `ab_compare.py` compares between the sides of an A/B.
+- The IR is written at process exit, also after a CUDA error that ends the session; not when the process itself dies (a segfault, an abort, a timeout kill).
 
 ## Keeping up with upstream
 
@@ -319,19 +325,19 @@ runs/softmax_20260716-031752/
    python gen_inventory.py --refresh-shapes shape/all_ops_multi.yaml
    ```
 
-   Curated shape sets (anything other than `all_ops_*`) are not rewritten by `--refresh-shapes`; check them instead and fix what it reports:
+   Check every shape set afterwards, the curated ones (anything other than `all_ops_*`) in particular, since `--refresh-shapes` never rewrites those; add a `--check-shapes <file>` for each set of your own. It exits with 1 on a problem and writes nothing:
 
    ```bash
-   python gen_inventory.py --check-shapes shape/DeepSeek-V4-Flash-p4096d1024.yaml --check-shapes my_shapes.yaml
+   python gen_inventory.py $(printf -- '--check-shapes %s ' shape/*.yaml)
    ```
 
-   A key matching no current op_name is **silently ignored at run time**: upstream falls back to the benchmark's own hardcoded shapes, the run looks clean, and the numbers are for shapes you did not ask for. A run also prints `SHAPE_KEYS_UNUSED` when an op it ran found no entry in the shape file, and `IR_DUMP_FAILED` / `ROWS_TSV_FAILED` when the IR dump or the row-to-kernel map could not be written — grep `run.log` for both.
+   A key matching no current op_name is **silently ignored at run time**: upstream falls back to the benchmark's own hardcoded shapes, the run looks clean, and the numbers are for shapes you did not ask for. The check reports such keys, keys that sit on the name of a test whose benchmark reads another op_name, and as a note the op_names that share a hardcoded-shape Benchmark class with a key of the set but have none themselves (in a curated set usually one repo's name for the benchmark, left out). At run time the same drift shows as `SHAPE_KEYS_UNUSED` in a set without class-name keys; in the `all_ops_*` sets the op falls to the `Benchmark` key and only the log line `shapes of ...: its own N` tells, so run the check. A lost IR dump shows as `IR_DUMP_FAILED` / `ROWS_TSV_FAILED`. A batch carries these markers into the notes of `ops_status.csv`.
 
    `--refresh-shapes` keeps the op_name keys that still exist upstream and syncs the core_shapes keys. Keys of renamed ops move to `shape/<name>.unmatched.yaml`: map them to the new name (`grep -rn 'op_name=' $FLAGGEMS_DIR/benchmark/test_<op>.py`), move them back and delete the file.
-3. Run a full screen. Add confirmed upstream or environment failures to `ops/dismiss.txt` with the reason and date, and now and then rerun the dismissed ops with `--ops-file` to remove those that pass again.
+3. Run a full screen. Rerun what fails with upstream's own pytest (`cd $FLAGGEMS_DIR && python -m pytest benchmark/test_<op_file>.py::test_<op> --level core --mode kernel`, no plugin and no shape file): a failure that is still there is upstream's or the environment's and goes into `ops/dismiss.txt` with the reason and date; one that is gone is the shape set's or a plugin's and is to be fixed here. Now and then rerun the dismissed ops with `--ops-file ops/dismiss.txt` and remove those that pass again.
 4. Update [Tested versions](#tested-versions) and the reference full run to the commits you screened.
 
-`ops/inventory_*.csv` has one row per test function: `op`, `op_file`, `marked_skip` (unconditional `pytest.mark.skip`), `collected` (pytest collect check) and `op_names`. Ops with `marked_skip=yes` or `collected=no` (e.g. FlagGems-vllm ops importable only on Ascend) are not part of `--all`.
+`ops/inventory_*.csv` has one row per test function: `repo`, `op`, `op_file`, `file`, `marked_skip` (unconditional `pytest.mark.skip`), `collected` (pytest collect check) and `op_names` (the op_name literals found in the test, empty where the name is computed). Ops with `marked_skip=yes` or `collected=no` (e.g. FlagGems-vllm ops importable only on Ascend) are not part of `--all`.
 
 ## FAQ
 
@@ -341,7 +347,7 @@ runs/softmax_20260716-031752/
 
 - **`ab_compare.py` leaves rows undecided.**
 
-  Their gap is above the threshold but the samples overlap too much for p < 0.01. Run `ab_run.py --until-decided` with a higher `--max-rounds`; rows that stay undecided are small or unstable effects.
+  Either they have fewer than `--min-rounds` rounds, or their gap is above the threshold and neither test shows it yet: the rank test is between 0.01 and 0.1 and the rounds do not all point one way. A row that `--confirm` did not reproduce is undecided too. Run `ab_run.py --until-decided` with a higher `--max-rounds`; rows that stay undecided are small or unstable effects.
 
 - **My latency differs a lot from someone else's.**
 
@@ -353,7 +359,11 @@ runs/softmax_20260716-031752/
 
 - **The first run of an op is very slow.**
 
-  Either `USE_FLAGTUNE=1`, whose first run searches the whole FlagTune space (over ten minutes for marlin, with `run.log` sitting on the test name meanwhile), or a libtuner op sweeping for the first time (about 50 minutes for mm). Winners persist in `~/.flaggems/config_cache/`, after which the same shapes take seconds. With the default `USE_FLAGTUNE=0` one shape usually takes around ten seconds; for many shapes use `PARALLEL_WARMUP_GPUS`.
+  Either `USE_FLAGTUNE=1`, whose first run searches the whole FlagTune space (over ten minutes for marlin, with `run.log` sitting on the test name meanwhile), or a libtuner op sweeping for the first time (about 50 minutes for mm). Winners persist in the libtuner cache (`~/.flaggems/config_cache/` for FlagGems, `~/.flagdnn/config_cache/` for FlagGems-vllm; `FLAGGEMS_CACHE_DIR` moves both), after which the same shapes take seconds. With the default `USE_FLAGTUNE=0` one shape usually takes around ten seconds of measurement, on top of the fixed cost of a run (next entry); for many shapes use `PARALLEL_WARMUP_GPUS`. A third cause is an op that hardcodes its shapes and has no entry in the shape set: it runs all of them (`SHAPE_KEYS_UNUSED`, or `shapes of ...: its own` in the log).
+
+- **Every op takes about 40 seconds, even a trivial one.**
+
+  That is the fixed cost of a run in a fresh process, which keeps an op's crash, its tuning state and its Triton cache to itself. Most of it is importing the operator library: about 18 s for `flag_gems` and 23 s for `flaggems_vllm` on an H20 box. A batch adds about 3 s for the idle-GPU check.
 
 - **Should I pass `--warmup` or `--iter`?**
 
@@ -377,8 +387,9 @@ ab_compare.py       per-row verdicts of an A/B, or a single comparison of two ru
 ab_stats.py         verdict rule and Mann-Whitney test
 ir_gate.py          compile-diff gate
 gen_inventory.py    op inventory and shape-set refresh
+shape_set.py        shape sets: keys scoped to one repo, resolved for each run
 batch_summary.py    run.log parsing and summary.csv
-_*_plugin.py        pytest plugins; _fg_benchmark.py, _term_style.py and _timing_scope.py are shared helpers
+_*_plugin.py        pytest plugins; _binary_id.py, _fg_benchmark.py, _shape_scope.py, _term_style.py and _timing_scope.py are shared helpers
 ops/                op inventories and the batch exclusion list
 shape/              shape sets
 tests/              unit tests of the GPU-free logic
