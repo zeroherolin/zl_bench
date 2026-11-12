@@ -54,6 +54,20 @@ PLUGINS=(
 
 # ============================== run ==============================
 
+# git_rev DIR: short revision of the checkout DIR is in, with -dirty when
+# tracked files differ from it; nothing if DIR is not in a git checkout. A
+# compiler under development is usually dirty, and two sides that log the same
+# revision are not the same build then.
+git_rev() {
+  local dir="$1" rev
+  [[ -n "$dir" && -d "$dir" ]] || return 0
+  rev="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)" || return 0
+  if [[ -n "$(git -C "$dir" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+    rev+="-dirty"
+  fi
+  printf '%s' "$rev"
+}
+
 if [[ -z "$SHAPE_FILE" ]]; then
   if [[ -n "$REPLAY_FROM" && -f "$REPLAY_FROM/shapes.yaml" ]]; then
     SHAPE_FILE="$REPLAY_FROM/shapes.yaml"
@@ -119,18 +133,37 @@ else
   MODE_DESC=record
 fi
 
-cp -f "$SHAPE_FILE" "$OUT_DIR/shapes.yaml"  # archive the shape set actually used
+# Archive the shape set actually used, and use the archive: a key of the set may be
+# scoped to one repo (`vllm:<name>`, shape_set.py), which upstream does not know, so
+# the run gets the set as its repo sees it. A set without scopes is copied as it is.
+# What it prints (a warning about a key, or why it failed) goes to run.log too: under
+# run_batch.py the log is all that is kept of a run.
+if ! shape_note="$(python "$SCRIPT_DIR/shape_set.py" resolve "$SHAPE_FILE" "$FLAGGEMS_DIR" "$OUT_DIR/shapes.yaml" 2>&1)"; then
+  echo "!!! cannot prepare the shape set $SHAPE_FILE: $shape_note" | tee "$LOG_FILE" >&2
+  exit 2
+fi
+SHAPE_SOURCE="$SHAPE_FILE"
+SHAPE_FILE="$OUT_DIR/shapes.yaml"
+# A reused OUT_DIR (run_batch.py retries into the same dir) must not keep the IR
+# of the earlier run next to this run's log.
+rm -rf "$OUT_DIR/ttgir" "$OUT_DIR/ttir" "$OUT_DIR/rows.tsv"
 
 status=0
 {
   echo "${C_BOLD}>>> op=$OP  mode=$MODE_DESC  USE_FLAGTUNE=$USE_FLAGTUNE${C_RESET}"
-  echo "${C_DIM}>>> out=$OUT_DIR  shapes=$SHAPE_FILE${C_RESET}"
-  # Log the compiler under test and the switches that affect compilation, so
-  # the two sides of an A/B can be reconciled. find_spec locates the package
-  # without importing it.
+  # The op as run_batch.py and ab_run.py select it; ir_gate.py reads it here to name
+  # the op of a single-op record in the op lists it writes.
+  echo "${C_DIM}>>> spec=$(python "$SCRIPT_DIR/shape_set.py" label "$FLAGGEMS_DIR"):$OP@$OP_FILE${C_RESET}"
+  echo "${C_DIM}>>> out=$OUT_DIR  shapes=$SHAPE_SOURCE${C_RESET}"
+  [[ -n "$shape_note" ]] && echo "${C_YELLOW}>>> $shape_note${C_RESET}"
+  # Log the compiler and the operator repo under test and the switches that
+  # affect compilation, so the two sides of an A/B can be reconciled.
+  # find_spec locates the package without importing it.
   triton_dir="$(python -c 'import importlib.util as u, os; s = u.find_spec("triton"); print(os.path.dirname(s.origin) if s else "")')"
-  triton_rev="$(git -C "$triton_dir" rev-parse --short HEAD 2>/dev/null || true)"
+  triton_rev="$(git_rev "$triton_dir")"
   echo "${C_DIM}>>> triton=${triton_dir:-not found}${triton_rev:+ (git $triton_rev)}${C_RESET}"
+  repo_rev="$(git_rev "$FLAGGEMS_DIR")"
+  echo "${C_DIM}>>> repo=$FLAGGEMS_DIR${repo_rev:+ (git $repo_rev)}${C_RESET}"
   compile_env="$(env | grep -E '^(FLAGTREE|TRITON|MLIR)_' | sort | tr '\n' ' ' || true)"
   [[ -n "$compile_env" ]] && echo "${C_DIM}>>> env: ${compile_env% }${C_RESET}"
 

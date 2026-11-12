@@ -1,6 +1,8 @@
 # Maintained by gen_inventory.py --refresh-shapes.
 # Top-level keys: FlagGems op_name or Benchmark class name (upstream's
 # fallback chain); ops with neither use their base-class DEFAULT_SHAPES.
+# A key `<repo>:<name>` applies to that repo only (main = FlagGems, vllm =
+# FlagGems-vllm) and beats the plain key there; see shape_set.py.
 # Keys other than the curated ones come from upstream core_shapes.yaml (one shape kept).
 AttentionBenchmark:
   shapes:
@@ -413,6 +415,10 @@ batch_norm_backward:
   shape_desc: N, C, *
   shapes:
   - [20, 6, 65536]
+batch_norm_elemt:
+  shape_desc: N, C, *spatial
+  shapes:
+  - [16, 256, 28, 28]
 bernoulli_:
   shape_desc: M, N
   shapes:
@@ -489,6 +495,10 @@ bmm_out:
   shape_desc: B, M, N, K
   shapes:
   - [16, 1024, 1024, 1024]
+bmm_w8a8:
+  shape_desc: B, M, N, K
+  shapes:
+  - [2, 33, 65, 129]
 cat_out:
   shape_desc: M, N
   shapes:
@@ -599,15 +609,20 @@ compute_global_topk_indices_and_lens:
   - [5, 4, 2, 4, 64]
 compute_linear_combination:
   shape_desc: M, N, K
-  shapes: &id001
+  shapes:
   - [256, 512, 1024]
 compute_linear_combination_out:
   shape_desc: M, N, K
-  shapes: *id001
+  shapes:
+  - [256, 512, 1024]
 concat_and_cache_mla:
   shape_desc: M, N
   shapes:
   - [16, 8, 84, 32, 4]
+concat_mla_q:
+  shape_desc: tokens, heads, nope_width, rope_width
+  shapes:
+  - [128, 64, 512, 64]
 concatenate:
   shape_desc: M, N
   shapes:
@@ -735,6 +750,10 @@ cudnn_rnn:
   shape_desc: seq, batch, input, hidden, layers, bidir, mode, batch_first
   shapes:
   - [16, 4, 128, 128, 1, 0, 0, 0]
+cudnn_rnn_backward:
+  shape_desc: seq, batch, input, hidden
+  shapes:
+  - [10, 32, 128, 128]
 cummax:
   shape_desc: M, N
   shapes:
@@ -847,6 +866,14 @@ embedding_dense_backward:
   shape_desc: M, N
   shapes:
   - [8, 4096, 256, 32768]
+embedding_spmdm:
+  shape_desc: V, D, B, S
+  shapes:
+  - [4096, 64, 128, 32]
+embedding_spmdm_weighted:
+  shape_desc: V, D, B, S
+  shapes:
+  - [4096, 64, 128, 32]
 eq:
   shape_desc: M, N
   shapes:
@@ -955,6 +982,10 @@ flash_mla_sparse_fwd:
   shape_desc: s_q, s_kv, topk, h_q, d_qk
   shapes:
   - [4096, 8192, 2048, 128, 576]
+flash_mla_with_kvcache_w8a8:
+  shape_desc: batch, queries, length, heads, varlen
+  shapes:
+  - [128, 1, 4096, 128, false]
 flip:
   shape_desc: M, N
   shapes:
@@ -1019,6 +1050,10 @@ fp8_paged_mqa_logits_gems_vs_deepgemm:
   shape_desc: batch_size, next_n, heads, head_dim, avg_kv
   shapes:
   - [1, 1, 16, 64, 1024]
+frobenius_norm:
+  shape_desc: M, N
+  shapes:
+  - [64, 512, 512]
 full:
   shape_desc: M, N
   shapes:
@@ -1035,6 +1070,10 @@ fused_add_rms_norm:
   shape_desc: M, N
   shapes:
   - [4096, 4096]
+fused_allreduce_rms_norm:
+  shape_desc: M, H
+  shapes:
+  - [138, 6144]
 fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert:
   shape_desc: num_tokens, num_heads, num_tokens_insert, block_size, max_pos, eps
   shapes:
@@ -1043,10 +1082,18 @@ fused_experts_impl:
   shape_desc: num_tokens, num_experts, hidden_size, intermediate_size, topk
   shapes:
   - [1, 8, 4096, 14336, 2]
+fused_indexer_weight_scale:
+  shape_desc: tokens, heads
+  shapes:
+  - [35, 32]
 fused_inv_rope_fp8_quant:
   shape_desc: num_tokens, num_heads, n_groups, tma_aligned_scales
   shapes:
   - [1024, 128, 8, true]
+fused_marlin_moe_w4a16:
+  shape_desc: num_tokens, num_experts, hidden_size, intermediate_size, topk
+  shapes:
+  - [1, 8, 4096, 14336, 2]
 fused_marlin_moe_w4a16_int4:
   shape_desc: num_tokens, num_experts, hidden_size, intermediate_size, topk
   shapes:
@@ -1055,9 +1102,11 @@ fused_marlin_moe_w4a16_mxfp4:
   shape_desc: num_tokens, num_experts, hidden_size, intermediate_size, topk
   shapes:
   - [1, 8, 4096, 14336, 2]
-# Upstream gives both W8A16 marlin benchmarks (fp8 and int8) the op_name
-# 'fused_marlin_moe_w8a16', so one entry drives both.
 fused_marlin_moe_w8a16:
+  shape_desc: num_tokens, num_experts, hidden_size, intermediate_size, topk
+  shapes:
+  - [1, 8, 4096, 14336, 2]
+fused_marlin_moe_w8a16_int8:
   shape_desc: num_tokens, num_experts, hidden_size, intermediate_size, topk
   shapes:
   - [1, 8, 4096, 14336, 2]
@@ -1073,6 +1122,14 @@ fused_q_kv_rmsnorm:
   shape_desc: M, N
   shapes:
   - [1, 1536, 512]
+fused_recurrent_gated_delta_rule_packed_decode:
+  shape_desc: B, H, HV, K, V
+  shapes:
+  - [16, 8, 16, 128, 128]
+gate_sigmoid_mul:
+  shape_desc: tokens, width, gate_layout
+  shapes:
+  - [256, 6144, contiguous]
 gather:
   shape_desc: M, N
   shapes:
@@ -1089,6 +1146,14 @@ gcd_out:
   shape_desc: M, N
   shapes:
   - [4096, 4096]
+gdn_w8a16:
+  shape_desc: N, T, H, HV, K, V
+  shapes:
+  - [128, 1, 2, 6, 128, 128]
+gdn_w8a16_int8:
+  shape_desc: 'decode: T,packed,HV,V; prefill: B,T,H,K,HV,V,N; update: update,B,T,H,K,HV,V,N'
+  shapes:
+  - [49, 8192, 32, 128]
 ge:
   shape_desc: M, N
   shapes:
@@ -1144,6 +1209,10 @@ group_norm:
   shape_desc: N, C, *
   shapes:
   - [20, 6, 65536]
+grouped_gemma_rmsnorm:
+  shape_desc: N, DIM, num_groups
+  shapes:
+  - [128, 10240, 4]
 grouped_mm:
   shape_desc: Groups, N, K
   shapes:
@@ -1180,6 +1249,10 @@ hardswish_:
   shape_desc: (B), M, N
   shapes:
   - [4096, 4096]
+hc_combine:
+  shape_desc: N, HC, D, layout, injection (none/same/fp32)
+  shapes:
+  - [16, 4, 4096, dense, none]
 hc_head_fused_kernel:
   shape_desc: N, hidden_size
   shapes:
@@ -1615,6 +1688,14 @@ moe_align_block_size_triton:
   shape_desc: M, N
   shapes:
   - [512, 64, 16384, 10]
+moe_load_balance_loss:
+  shape_desc: T, N_e, K
+  shapes:
+  - [4096, 16, 2]
+moe_load_balance_loss_mask:
+  shape_desc: T, N_e, K
+  shapes:
+  - [4096, 16, 2]
 moe_sum:
   shape_desc: M, N
   shapes:
@@ -2079,19 +2160,19 @@ searchsorted_scalar_out:
 segment_reduce:
   shape_desc: data shape
   shapes:
-  - &id002 [4096, 4096]
+  - [4096, 4096]
 segment_reduce_backward:
   shape_desc: data shape
   shapes:
-  - *id002
+  - [4096, 4096]
 segment_reduce_backward_out:
   shape_desc: data shape
   shapes:
-  - *id002
+  - [4096, 4096]
 segment_reduce_out:
   shape_desc: data shape
   shapes:
-  - *id002
+  - [4096, 4096]
 select_backward:
   shape_desc: M, N
   shapes:
@@ -2203,6 +2284,9 @@ softmax:
 softmax_backward:
   shapes:
   - [4096, 4096]
+softmax_backward_data:
+  shapes:
+  - [4096, 4096]
 softmax_backward_out:
   shape_desc: M, N
   shapes:
@@ -2235,6 +2319,14 @@ sparse_attention:
   shape_desc: B, M, KV_LEN, TOPK, H, D
   shapes:
   - [16, 1, 136, 136, 8, 512]
+sparse_flash_attention:
+  shape_desc: batch, capacity_per_request, valid_kv_length; H=128, D=512+64, topk=2048
+  shapes:
+  - [8, 48000, 2560]
+sparse_mm_reduce_impl:
+  shape_desc: B, M, N, K
+  shapes:
+  - [16, 2048, 2048, 2048]
 sparse_sampled_addmm:
   shape_desc: B, M, N, K
   shapes:
@@ -2522,6 +2614,14 @@ view_copy:
   shape_desc: (B), M, N
   shapes:
   - [64, 64]
+vllm:bmm_w8a8:
+  shape_desc: B, M, N, K
+  shapes:
+  - [4, 129, 17, 257]
+vllm:fused_recurrent_gated_delta_rule:
+  shape_desc: case (baseline.PERF_CASES)
+  shapes:
+  - [decode64]
 vstack:
   shape_desc: M, N
   shapes:

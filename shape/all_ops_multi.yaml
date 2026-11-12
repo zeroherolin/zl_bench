@@ -1,6 +1,8 @@
 # Maintained by gen_inventory.py --refresh-shapes.
 # Top-level keys: FlagGems op_name or Benchmark class name (upstream's
 # fallback chain); ops with neither use their base-class DEFAULT_SHAPES.
+# A key `<repo>:<name>` applies to that repo only (main = FlagGems, vllm =
+# FlagGems-vllm) and beats the plain key there; see shape_set.py.
 # Keys other than the curated ones come from upstream core_shapes.yaml.
 AttentionBenchmark:
   shapes:
@@ -1834,6 +1836,16 @@ batch_norm_backward:
   - [16, 16, 4098]
   - [1, 8, 4, 4]
   - [16, 8, 128, 128]
+batch_norm_elemt:
+  shape_desc: N, C, *spatial
+  shapes:
+  - [2, 64, 112, 112]
+  - [8, 128, 56, 56]
+  - [16, 256, 28, 28]
+  - [32, 512, 14, 14]
+  - [64, 1024, 7, 7]
+  - [128, 256, 32, 32]
+  - [4, 32, 8, 8, 8]
 bernoulli_:
   shape_desc: M, N
   shapes:
@@ -2357,6 +2369,12 @@ bmm_out:
   - [4, 8192, 37888, 3584]
   - [4, 8192, 512, 3584]
   - [4, 8192, 4608, 3584]
+bmm_w8a8:
+  shape_desc: B, M, N, K
+  shapes:
+  - [1, 1, 1024, 4096]
+  - [1, 128, 1024, 4096]
+  - [2, 33, 65, 129]
 cat_out:
   shape_desc: M, N
   shapes:
@@ -2781,14 +2799,18 @@ compute_global_topk_indices_and_lens:
   - [8192, 128, 8, 1280, 64]
 compute_linear_combination:
   shape_desc: M, N, K
-  shapes: &id001
+  shapes:
   - [64, 64, 64]
   - [128, 256, 512]
   - [256, 512, 1024]
   - [8, 1024, 4096]
 compute_linear_combination_out:
   shape_desc: M, N, K
-  shapes: *id001
+  shapes:
+  - [64, 64, 64]
+  - [128, 256, 512]
+  - [256, 512, 1024]
+  - [8, 1024, 4096]
 concat_and_cache_mla:
   shape_desc: M, N
   shapes:
@@ -2797,6 +2819,13 @@ concat_and_cache_mla:
   - [64, 8, 21, 8, 4]
   - [512, 64, 42, 16, 8]
   - [1024, 64, 84, 16, 8]
+concat_mla_q:
+  shape_desc: tokens, heads, nope_width, rope_width
+  shapes:
+  - [1, 64, 512, 64]
+  - [7, 64, 512, 64]
+  - [128, 64, 512, 64]
+  - [8192, 64, 512, 64]
 concatenate:
   shape_desc: M, N
   shapes:
@@ -3216,6 +3245,12 @@ cudnn_rnn:
   - [16, 4, 128, 128, 1, 0, 0, 0]
   - [16, 4, 128, 128, 1, 0, 3, 0]
   - [16, 4, 128, 128, 1, 1, 2, 0]
+cudnn_rnn_backward:
+  shape_desc: seq, batch, input, hidden
+  shapes:
+  - [4, 3, 16, 16]
+  - [8, 16, 64, 64]
+  - [10, 32, 128, 128]
 cummax:
   shape_desc: M, N
   shapes:
@@ -3589,6 +3624,32 @@ embedding_dense_backward:
   - [32, 2048, 128, 8192]
   - [16, 2048, 256, 16384]
   - [8, 4096, 256, 32768]
+embedding_spmdm:
+  shape_desc: V, D, B, S
+  shapes:
+  - [1024, 32, 64, 8]
+  - [1024, 64, 64, 16]
+  - [4096, 64, 128, 32]
+  - [4096, 128, 128, 32]
+  - [8192, 128, 256, 16]
+  - [8192, 256, 256, 32]
+  - [16384, 128, 512, 64]
+  - [32768, 256, 256, 64]
+  - [65536, 128, 1024, 32]
+  - [131072, 64, 2048, 16]
+embedding_spmdm_weighted:
+  shape_desc: V, D, B, S
+  shapes:
+  - [1024, 32, 64, 8]
+  - [1024, 64, 64, 16]
+  - [4096, 64, 128, 32]
+  - [4096, 128, 128, 32]
+  - [8192, 128, 256, 16]
+  - [8192, 256, 256, 32]
+  - [16384, 128, 512, 64]
+  - [32768, 256, 256, 64]
+  - [65536, 128, 1024, 32]
+  - [131072, 64, 2048, 16]
 eq:
   shape_desc: M, N
   shapes:
@@ -4022,6 +4083,29 @@ flash_mla_sparse_fwd:
   - [4096, 32768, 1024, 128, 512]
   - [4096, 49152, 1024, 128, 512]
   - [4096, 65536, 1024, 128, 512]
+flash_mla_with_kvcache_w8a8:
+  shape_desc: batch, queries, length, heads, varlen
+  shapes:
+  - [128, 1, 4096, 16, false]
+  - [128, 1, 4096, 16, true]
+  - [128, 1, 4096, 128, false]
+  - [128, 1, 4096, 128, true]
+  - [128, 2, 4096, 128, false]
+  - [128, 2, 4096, 128, true]
+  - [128, 1, 8192, 64, false]
+  - [128, 1, 8192, 64, true]
+  - [128, 2, 8192, 64, false]
+  - [128, 2, 8192, 64, true]
+  - [128, 1, 8192, 128, false]
+  - [128, 1, 8192, 128, true]
+  - [128, 2, 8192, 128, false]
+  - [128, 2, 8192, 128, true]
+  - [128, 2, 16384, 32, false]
+  - [128, 2, 16384, 32, true]
+  - [128, 1, 16384, 128, false]
+  - [128, 1, 16384, 128, true]
+  - [128, 2, 16384, 128, false]
+  - [128, 2, 16384, 128, true]
 flip:
   shape_desc: M, N
   shapes:
@@ -4273,6 +4357,17 @@ fp8_paged_mqa_logits_gems_vs_deepgemm:
   - [4, 1, 32, 128, 2048]
   - [2, 2, 32, 128, 2048]
   - [8, 1, 32, 128, 3072]
+frobenius_norm:
+  shape_desc: M, N
+  shapes:
+  - [64, 64]
+  - [4096, 4096]
+  - [64, 512, 512]
+  - [1024, 1024, 1024]
+  - [1048576, 2]
+  - [2097152, 4]
+  - [1048576, 16]
+  - [65536, 64]
 full:
   shape_desc: M, N
   shapes:
@@ -4332,6 +4427,11 @@ fused_add_rms_norm:
   - [100, 1, 100]
   - [100, 256, 100]
   - [100, 65536, 100]
+fused_allreduce_rms_norm:
+  shape_desc: M, H
+  shapes:
+  - [6, 6144]
+  - [138, 6144]
 fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert:
   shape_desc: num_tokens, num_heads, num_tokens_insert, block_size, max_pos, eps
   shapes:
@@ -4379,6 +4479,19 @@ fused_experts_impl:
   - [64, 512, 4096, 1024, 10]
   - [128, 512, 4096, 1024, 10]
   - [256, 512, 4096, 1024, 10]
+fused_indexer_weight_scale:
+  shape_desc: tokens, heads
+  shapes:
+  - [4, 32]
+  - [8, 32]
+  - [35, 32]
+  - [65, 32]
+  - [18, 32]
+  - [46, 32]
+  - [13, 32]
+  - [51, 32]
+  - [24, 32]
+  - [76, 32]
 fused_inv_rope_fp8_quant:
   shape_desc: num_tokens, num_heads, n_groups, tma_aligned_scales
   shapes:
@@ -4387,6 +4500,41 @@ fused_inv_rope_fp8_quant:
   - [1024, 128, 8, true]
   - [2048, 128, 8, true]
   - [4096, 128, 8, true]
+fused_marlin_moe_w4a16:
+  shape_desc: num_tokens, num_experts, hidden_size, intermediate_size, topk
+  shapes:
+  - [1, 8, 4096, 14336, 2]
+  - [4, 8, 4096, 14336, 2]
+  - [8, 8, 4096, 14336, 2]
+  - [16, 8, 4096, 14336, 2]
+  - [32, 8, 4096, 14336, 2]
+  - [64, 8, 4096, 14336, 2]
+  - [128, 8, 4096, 14336, 2]
+  - [256, 8, 4096, 14336, 2]
+  - [1, 256, 7168, 2048, 8]
+  - [4, 256, 7168, 2048, 8]
+  - [8, 256, 7168, 2048, 8]
+  - [16, 256, 7168, 2048, 8]
+  - [32, 256, 7168, 2048, 8]
+  - [64, 256, 7168, 2048, 8]
+  - [128, 256, 7168, 2048, 8]
+  - [256, 256, 7168, 2048, 8]
+  - [1, 512, 4096, 1024, 10]
+  - [4, 512, 4096, 1024, 10]
+  - [8, 512, 4096, 1024, 10]
+  - [16, 512, 4096, 1024, 10]
+  - [32, 512, 4096, 1024, 10]
+  - [64, 512, 4096, 1024, 10]
+  - [128, 512, 4096, 1024, 10]
+  - [256, 512, 4096, 1024, 10]
+  - [1, 256, 4096, 2048, 6]
+  - [4, 256, 4096, 2048, 6]
+  - [8, 256, 4096, 2048, 6]
+  - [16, 256, 4096, 2048, 6]
+  - [32, 256, 4096, 2048, 6]
+  - [64, 256, 4096, 2048, 6]
+  - [128, 256, 4096, 2048, 6]
+  - [256, 256, 4096, 2048, 6]
 fused_marlin_moe_w4a16_int4:
   shape_desc: num_tokens, num_experts, hidden_size, intermediate_size, topk
   shapes:
@@ -4457,9 +4605,42 @@ fused_marlin_moe_w4a16_mxfp4:
   - [64, 256, 4096, 2048, 6]
   - [128, 256, 4096, 2048, 6]
   - [256, 256, 4096, 2048, 6]
-# Upstream gives both W8A16 marlin benchmarks (fp8 and int8) the op_name
-# 'fused_marlin_moe_w8a16', so one entry drives both.
 fused_marlin_moe_w8a16:
+  shape_desc: num_tokens, num_experts, hidden_size, intermediate_size, topk
+  shapes:
+  - [1, 8, 4096, 14336, 2]
+  - [4, 8, 4096, 14336, 2]
+  - [8, 8, 4096, 14336, 2]
+  - [16, 8, 4096, 14336, 2]
+  - [32, 8, 4096, 14336, 2]
+  - [64, 8, 4096, 14336, 2]
+  - [128, 8, 4096, 14336, 2]
+  - [256, 8, 4096, 14336, 2]
+  - [1, 256, 7168, 2048, 8]
+  - [4, 256, 7168, 2048, 8]
+  - [8, 256, 7168, 2048, 8]
+  - [16, 256, 7168, 2048, 8]
+  - [32, 256, 7168, 2048, 8]
+  - [64, 256, 7168, 2048, 8]
+  - [128, 256, 7168, 2048, 8]
+  - [256, 256, 7168, 2048, 8]
+  - [1, 512, 4096, 1024, 10]
+  - [4, 512, 4096, 1024, 10]
+  - [8, 512, 4096, 1024, 10]
+  - [16, 512, 4096, 1024, 10]
+  - [32, 512, 4096, 1024, 10]
+  - [64, 512, 4096, 1024, 10]
+  - [128, 512, 4096, 1024, 10]
+  - [256, 512, 4096, 1024, 10]
+  - [1, 256, 4096, 2048, 6]
+  - [4, 256, 4096, 2048, 6]
+  - [8, 256, 4096, 2048, 6]
+  - [16, 256, 4096, 2048, 6]
+  - [32, 256, 4096, 2048, 6]
+  - [64, 256, 4096, 2048, 6]
+  - [128, 256, 4096, 2048, 6]
+  - [256, 256, 4096, 2048, 6]
+fused_marlin_moe_w8a16_int8:
   shape_desc: num_tokens, num_experts, hidden_size, intermediate_size, topk
   shapes:
   - [1, 8, 4096, 14336, 2]
@@ -4516,6 +4697,26 @@ fused_q_kv_rmsnorm:
   - [2048, 1536, 512]
   - [32, 36864, 576]
   - [128, 36864, 576]
+fused_recurrent_gated_delta_rule_packed_decode:
+  shape_desc: B, H, HV, K, V
+  shapes:
+  - [1, 8, 16, 128, 128]
+  - [4, 8, 16, 128, 128]
+  - [16, 8, 16, 128, 128]
+  - [64, 8, 16, 128, 128]
+  - [256, 8, 16, 128, 128]
+  - [9, 4, 12, 64, 32]
+  - [3, 2, 4, 17, 23]
+  - [1, 16, 64, 128, 128]
+gate_sigmoid_mul:
+  shape_desc: tokens, width, gate_layout
+  shapes:
+  - [1, 1536, contiguous]
+  - [16, 3072, split_gate]
+  - [256, 6144, contiguous]
+  - [511, 12288, split_gate]
+  - [512, 12288, contiguous]
+  - [4096, 12288, split_gate]
 gather:
   shape_desc: M, N
   shapes:
@@ -4568,6 +4769,30 @@ gcd_out:
   - [100, 1, 100]
   - [100, 256, 100]
   - [100, 65536, 100]
+gdn_w8a16:
+  shape_desc: N, T, H, HV, K, V
+  shapes:
+  - [1, 1, 2, 4, 128, 128]
+  - [32, 1, 2, 4, 128, 128]
+  - [128, 1, 2, 6, 128, 128]
+  - [1024, 1, 2, 6, 128, 128]
+  - [8192, 1, 2, 6, 128, 128]
+  - [1, 8, 2, 4, 128, 128]
+  - [2, 192, 2, 6, 128, 128]
+  - [16, 128, 2, 4, 128, 128]
+gdn_w8a16_int8:
+  shape_desc: 'decode: T,packed,HV,V; prefill: B,T,H,K,HV,V,N; update: update,B,T,H,K,HV,V,N'
+  shapes:
+  - [1, 8192, 32, 128]
+  - [3, 8192, 32, 128]
+  - [49, 8192, 32, 128]
+  - [2, 8192, 32, 128]
+  - [31, 8192, 32, 128]
+  - [7, 8192, 32, 128]
+  - [33, 8192, 32, 128]
+  - [29, 8192, 32, 128]
+  - [35, 8192, 32, 128]
+  - [51, 8192, 32, 128]
 ge:
   shape_desc: M, N
   shapes:
@@ -4779,6 +5004,11 @@ group_norm:
   - [16, 16, 4098]
   - [1, 8, 4, 4]
   - [16, 8, 128, 128]
+grouped_gemma_rmsnorm:
+  shape_desc: N, DIM, num_groups
+  shapes:
+  - [1, 8192, 1]
+  - [128, 10240, 4]
 grouped_mm:
   shape_desc: Groups, N, K
   shapes:
@@ -4906,6 +5136,17 @@ hardswish_:
   - [64, 64, 16]
   - [64, 64, 256]
   - [64, 64, 4096]
+hc_combine:
+  shape_desc: N, HC, D, layout, injection (none/same/fp32)
+  shapes:
+  - [1, 4, 4096, dense, none]
+  - [1, 4, 4096, packed, fp32]
+  - [16, 4, 4096, dense, none]
+  - [16, 4, 4096, packed, fp32]
+  - [1024, 4, 4096, dense, none]
+  - [1024, 4, 4096, packed, fp32]
+  - [4096, 4, 1024, dense, none]
+  - [4096, 4, 1024, packed, fp32]
 hc_head_fused_kernel:
   shape_desc: N, hidden_size
   shapes:
@@ -6862,6 +7103,24 @@ moe_align_block_size_triton:
   - [512, 64, 7561, 10]
   - [512, 64, 4104, 10]
   - [512, 64, 14281, 10]
+moe_load_balance_loss:
+  shape_desc: T, N_e, K
+  shapes:
+  - [256, 8, 2]
+  - [1024, 8, 2]
+  - [4096, 16, 2]
+  - [4096, 64, 4]
+  - [16384, 64, 4]
+  - [32768, 128, 8]
+moe_load_balance_loss_mask:
+  shape_desc: T, N_e, K
+  shapes:
+  - [256, 8, 2]
+  - [1024, 8, 2]
+  - [4096, 16, 2]
+  - [4096, 64, 4]
+  - [16384, 64, 4]
+  - [32768, 128, 8]
 moe_sum:
   shape_desc: M, N
   shapes:
@@ -8311,7 +8570,7 @@ searchsorted_scalar_out:
     - true
 segment_reduce:
   shape_desc: data shape
-  shapes: &id002
+  shapes:
   - [1048576]
   - [64, 64]
   - [4096, 4096]
@@ -8319,13 +8578,28 @@ segment_reduce:
   - [1024, 1024, 1024]
 segment_reduce_backward:
   shape_desc: data shape
-  shapes: *id002
+  shapes:
+  - [1048576]
+  - [64, 64]
+  - [4096, 4096]
+  - [64, 512, 512]
+  - [1024, 1024, 1024]
 segment_reduce_backward_out:
   shape_desc: data shape
-  shapes: *id002
+  shapes:
+  - [1048576]
+  - [64, 64]
+  - [4096, 4096]
+  - [64, 512, 512]
+  - [1024, 1024, 1024]
 segment_reduce_out:
   shape_desc: data shape
-  shapes: *id002
+  shapes:
+  - [1048576]
+  - [64, 64]
+  - [4096, 4096]
+  - [64, 512, 512]
+  - [1024, 1024, 1024]
 select_backward:
   shape_desc: M, N
   shapes:
@@ -8725,6 +8999,13 @@ softmax_backward:
   - [4096, 4096]
   - [64, 512, 512]
   - [256, 1024, 1024]
+softmax_backward_data:
+  shapes:
+  - [1048576]
+  - [64, 64]
+  - [4096, 4096]
+  - [64, 512, 512]
+  - [1024, 1024, 1024]
 softmax_backward_out:
   shape_desc: M, N
   shapes:
@@ -8845,6 +9126,23 @@ sparse_attention:
   - [64, 1, 392, 385, 8, 512]
   - [64, 1, 392, 388, 8, 512]
   - [64, 1, 392, 389, 8, 512]
+sparse_flash_attention:
+  shape_desc: batch, capacity_per_request, valid_kv_length; H=128, D=512+64, topk=2048
+  shapes:
+  - [1, 2560, 2560]
+  - [4, 6400, 2560]
+  - [8, 48000, 2560]
+  - [16, 48000, 2560]
+  - [16, 48000, 48000]
+sparse_mm_reduce_impl:
+  shape_desc: B, M, N, K
+  shapes:
+  - [2, 512, 512, 512]
+  - [8, 1024, 1024, 1024]
+  - [16, 2048, 2048, 2048]
+  - [4, 4096, 4096, 4096]
+  - [2, 4096, 1024, 4096]
+  - [8, 4096, 256, 4096]
 sparse_sampled_addmm:
   shape_desc: B, M, N, K
   shapes:
@@ -9828,6 +10126,23 @@ view_copy:
   - [64, 64, 16]
   - [64, 64, 256]
   - [64, 64, 4096]
+vllm:bmm_w8a8:
+  shape_desc: B, M, N, K
+  shapes:
+  - [1, 33, 65, 129]
+  - [2, 64, 128, 256]
+  - [4, 129, 17, 257]
+vllm:fused_recurrent_gated_delta_rule:
+  shape_desc: case (baseline.PERF_CASES)
+  shapes:
+  - [decode1]
+  - [decode16]
+  - [decode64]
+  - [decode256]
+  - [strided]
+  - [mtp]
+  - [ragged]
+  - [tail]
 vstack:
   shape_desc: M, N
   shapes:
