@@ -206,16 +206,36 @@ def test_waiting_for_a_busy_gpu_can_be_interrupted(fresh_stop, monkeypatch):
     assert time.time() - t0 < 5
 
 
-@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
-def test_run_workers_stops_on_a_signal(fresh_stop, sig):
-    before = [signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)]
+@pytest.fixture
+def default_signals():
+    """SIGINT, SIGTERM and SIGHUP as a foreground process has them, whatever pytest was
+    started under (nohup, a background job). Yields their handlers."""
+    wanted = {signal.SIGINT: signal.default_int_handler, signal.SIGTERM: signal.SIG_DFL,
+              signal.SIGHUP: signal.SIG_DFL}
+    previous = {sig: signal.signal(sig, handler) for sig, handler in wanted.items()}
+    yield list(wanted.values())
+    for sig, handler in previous.items():
+        signal.signal(sig, handler if handler is not None else signal.SIG_DFL)
+
+
+def _handlers():
+    return [signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)]
+
+
+each_signal = pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP],
+                                      ids=["SIGINT", "SIGTERM", "SIGHUP"])
+
+
+@each_signal
+@pytest.mark.parametrize("receiver", ["process", "another thread"])
+def test_run_workers_stops_on_a_signal(fresh_stop, default_signals, sig, receiver):
     started, done = threading.Event(), []
 
     def job():
         for i in range(3):
             if run_batch.stopping():
                 return
-            proc = _sleeper()
+            proc = _sleeper(10)
             started.set()
             run_batch._wait(proc, 0)
             if run_batch.stopping():
@@ -224,16 +244,35 @@ def test_run_workers_stops_on_a_signal(fresh_stop, sig):
 
     def interrupt():
         started.wait()
-        os.kill(os.getpid(), sig)
+        if receiver == "process":
+            os.kill(os.getpid(), sig)
+        else:
+            # The kernel may hand a signal to any thread, and one that another thread
+            # receives does not wake a main thread blocked in join().
+            signal.pthread_kill(threading.get_ident(), sig)
 
     threading.Thread(target=interrupt).start()
     t0 = time.time()
     assert run_batch.run_workers([job, job]) is False
-    assert time.time() - t0 < 10 and done == []  # no run went on after the interrupt
-    assert [signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)] == before
+    assert time.time() - t0 < 8 and done == []  # no run went on after the interrupt
+    assert _handlers() == default_signals  # put back
 
 
-def test_a_second_ctrl_c_does_not_leave_runs_behind(fresh_stop, monkeypatch):
+def test_a_signal_while_the_jobs_are_started_stops_them_too(fresh_stop, default_signals):
+    # The first job runs, and the signal arrives, before the last thread is started: the
+    # main thread is then inside Thread.start(), not waiting for the jobs yet.
+    def first():
+        os.kill(os.getpid(), signal.SIGTERM)
+        while not run_batch.stopping():
+            time.sleep(0.01)
+        raise run_batch.Interrupted
+
+    t0 = time.time()
+    assert run_batch.run_workers([first] + [lambda: None] * 50) is False
+    assert time.time() - t0 < 5 and _handlers() == default_signals
+
+
+def test_a_second_ctrl_c_does_not_leave_runs_behind(fresh_stop, default_signals, monkeypatch):
     procs, started = [], threading.Event()
     stop_all = run_batch.stop_all
 
@@ -259,15 +298,13 @@ def test_a_second_ctrl_c_does_not_leave_runs_behind(fresh_stop, monkeypatch):
     assert _group_gone(procs[0].pid)
 
 
-def test_an_ignored_hangup_stays_ignored(fresh_stop, monkeypatch):
-    # under nohup the driver is meant to survive its terminal
-    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
-    try:
-        seen = []
-        assert run_batch.run_workers([lambda: seen.append(signal.getsignal(signal.SIGHUP))]) is True
-        assert seen == [signal.SIG_IGN] and signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
-    finally:
-        signal.signal(signal.SIGHUP, previous)
+@each_signal
+def test_a_signal_the_caller_ignores_stays_ignored(fresh_stop, default_signals, sig):
+    # under nohup, or as a background job, the driver is meant to go on
+    signal.signal(sig, signal.SIG_IGN)
+    seen = []
+    assert run_batch.run_workers([lambda: seen.append(signal.getsignal(sig))]) is True
+    assert seen == [signal.SIG_IGN] and signal.getsignal(sig) is signal.SIG_IGN
 
 
 def test_run_workers_reports_a_job_error(fresh_stop):

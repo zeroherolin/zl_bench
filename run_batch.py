@@ -78,7 +78,8 @@ STATUS_FIELDS = [
 
 DTYPE_UNSUPPORTED_MARK = "can't be supported by this op"
 TERM_GRACE_S = 10  # between SIGTERM and SIGKILL when a run is stopped
-STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)  # stop the driver like Ctrl-C (run_workers)
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)  # stop the driver and its runs (run_workers)
+SIGNAL_POLL_S = 0.2  # how often run_workers looks for a signal while its jobs run
 
 # Every run is a session of its own, so that a timeout can kill the whole process group.
 # That also means the runs do not get the terminal's Ctrl-C and outlive a driver that
@@ -577,6 +578,7 @@ def run_workers(jobs: Sequence[Callable[[], None]]) -> bool:
     exception of a job is raised here once all jobs are done.
     """
     errors: List[BaseException] = []
+    received: List[int] = []  # the signals on_signal took note of
 
     def guarded(job: Callable[[], None]) -> None:
         try:
@@ -587,35 +589,39 @@ def run_workers(jobs: Sequence[Callable[[], None]]) -> bool:
             errors.append(exc)
 
     def on_signal(signum, frame):
-        raise KeyboardInterrupt
+        received.append(signum)
 
     # SIGTERM and a closed terminal (SIGHUP) stop the driver the way Ctrl-C does: left to
     # their defaults they kill it, and its runs, sessions of their own, go on without it.
-    # A signal the caller ignores (nohup) stays ignored.
+    # A signal the caller ignores (nohup, a background job) stays ignored.
+    #
+    # The handler only takes note, and the loop below acts on it. A handler that raises
+    # does so wherever the main thread happens to be, between starting two threads as
+    # well. And the main thread polls: the kernel may hand a signal to any thread, which
+    # does not wake a main thread blocked in join().
     saved: Dict[int, object] = {}
-    in_main = threading.current_thread() is threading.main_thread()
-    if in_main:
+    if threading.current_thread() is threading.main_thread():
         for sig in STOP_SIGNALS:
             if signal.getsignal(sig) is not signal.SIG_IGN:
                 saved[sig] = signal.signal(sig, on_signal)
     threads = [threading.Thread(target=guarded, args=(job,)) for job in jobs]
-    completed = True
+    started: List[threading.Thread] = []
     try:
         for t in threads:
+            if received:
+                break
             t.start()
-        for t in threads:
-            t.join()
-    except KeyboardInterrupt:
-        completed = False
-        print(f"{LOG} interrupted: stopping the runs under way", flush=True)
-        if in_main:
-            # A second Ctrl-C must not cut this short: the runs would be left behind,
-            # which is what the first one asked to prevent. It takes TERM_GRACE_S at most.
-            saved.setdefault(signal.SIGINT, signal.getsignal(signal.SIGINT))
-            for sig in saved:
-                signal.signal(sig, signal.SIG_IGN)
-        stop_all()
-        for t in threads:
+            started.append(t)
+        alive = started
+        while alive and not received:
+            alive[0].join(SIGNAL_POLL_S)
+            alive = [t for t in alive if t.is_alive()]
+        if received:
+            # Further signals are only noted: stopping the runs must not be cut short,
+            # or they would be left behind. It takes TERM_GRACE_S at most.
+            print(f"{LOG} interrupted: stopping the runs under way", flush=True)
+            stop_all()
+        for t in started:
             t.join()
     finally:
         for sig, handler in saved.items():
@@ -623,7 +629,7 @@ def run_workers(jobs: Sequence[Callable[[], None]]) -> bool:
             signal.signal(sig, handler if handler is not None else signal.SIG_DFL)
     if errors:
         raise errors[0]
-    return completed
+    return not received
 
 
 def _read_log(out_dir: Path) -> str:
