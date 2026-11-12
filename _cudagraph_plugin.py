@@ -15,10 +15,11 @@ after Triton is loaded but before any benchmark calls it. Per measurement:
    the graph several times per sample, so a sample still spans the rep
    budget. An out-of-memory capture is retried with one call per graph.
 
-A call that cannot be timed this way falls back to plain do_bench and prints
-a BENCHMARK_DIRECT_NO_CUDAGRAPH marker into the log. Captures run under a
-scratch CUDA RNG state (_capture_with_scratch_rng); an aborted capture is
-released (_release_memory) and followed by one untimed call
+A call that cannot be captured falls back to plain do_bench and prints a
+BENCHMARK_DIRECT_NO_CUDAGRAPH marker into the log; a call that fails by itself,
+during warmup and before any capture, raises as it would under do_bench.
+Captures run under a scratch CUDA RNG state (_capture_with_scratch_rng); an
+aborted capture is released (_release_memory) and followed by one untimed call
 (_absorb_aborted_capture) before the fallback.
 """
 
@@ -42,7 +43,15 @@ N_SAMPLES = 10  # graph replays per measurement, as in do_bench_cudagraph
 def max_calls_per_graph() -> int:
     """Cap on the calls unrolled into one graph; 0 = no cap."""
     value = os.environ.get(_MAX_CALLS_ENV, "").strip()
-    return int(value) if value else DEFAULT_MAX_CALLS
+    if not value:
+        return DEFAULT_MAX_CALLS
+    try:
+        cap = int(value)
+    except ValueError:
+        cap = -1
+    if cap < 0:
+        raise ValueError(f"{_MAX_CALLS_ENV}={value!r}: expected a call count, or 0 for no cap")
+    return cap
 
 
 def graph_plan(estimate_ms: float, rep_ms: float, cap: int):
@@ -289,19 +298,23 @@ def _patched_do_bench(fn, warmup=25, rep=100, grad_to_none=None,
     """Drop-in replacement for triton.testing.do_bench using CUDA-graph timing."""
     op = os.environ.get("FLAGGEMS_PERF_CURRENT_OP", "<unknown>")
     fn = _timing_scope.timed(fn)  # its launches are the measurement's (_ir_dump_plugin)
-    phase = "sync"  # which step rejected the graph, for the fallback marker
+    # The graph runs on a fresh side stream; input tensors produced just
+    # before (quantize/topk in the input iter) may still be in flight, and
+    # racing on them intermittently kills the context (illegal instruction
+    # from a device trap on garbage indices). Sync before switching streams.
+    import torch
+    torch.cuda.synchronize()
+    # Settle autotune/JIT before capture (rationale: _warmup_before_capture). Outside
+    # the fallback: fn runs here as it would under plain do_bench, so an error is fn's
+    # own and plain do_bench would only raise it again. The autotuner times every
+    # config of a sweep through do_bench and drops the ones that raise (too much
+    # shared memory for the GPU, a failed compile); falling back would run each of
+    # them once more for the same error, and mark it as a measurement that could not
+    # be captured.
+    _warmup_before_capture(fn, warmup, grad_to_none)
+    phase = "host_sync"  # which step rejected the graph, for the fallback marker
     failure = None
     try:
-        # The graph runs on a fresh side stream; input tensors produced just
-        # before (quantize/topk in the input iter) may still be in flight, and
-        # racing on them intermittently kills the context (illegal instruction
-        # from a device trap on garbage indices). Sync before switching streams.
-        import torch
-        torch.cuda.synchronize()
-        phase = "warmup"
-        # Settle autotune/JIT before capture (rationale: _warmup_before_capture).
-        _warmup_before_capture(fn, warmup, grad_to_none)
-        phase = "host_sync"
         sync = _find_host_sync(lambda: _run_once(fn, grad_to_none))
         if sync:
             raise _HostSync(sync)
@@ -330,13 +343,17 @@ def _patched_do_bench(fn, warmup=25, rep=100, grad_to_none=None,
 
 def pytest_configure(config):
     global _ORIGINAL_DO_BENCH
+    import pytest
     import triton.testing
 
     from _term_style import tag
+    try:
+        cap = max_calls_per_graph()
+    except ValueError as exc:
+        # a usage error: pytest prints the one line, not an internal-error traceback
+        raise pytest.UsageError(str(exc)) from None
     _ORIGINAL_DO_BENCH = triton.testing.do_bench
     triton.testing.do_bench = _patched_do_bench
-    _timing_scope.enabled = True
-    cap = max_calls_per_graph()
     print(f"{tag('[cudagraph-plugin]')} triton.testing.do_bench → CUDA-graph timing "
           f"({f'at most {cap} calls per graph' if cap > 0 else 'no cap on calls per graph'})",
           file=sys.stderr, flush=True)

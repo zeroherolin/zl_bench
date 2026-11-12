@@ -14,7 +14,9 @@ the normal single-process single-GPU path, which times things exactly as it woul
 without the plugin.
 
 Enable with PARALLEL_WARMUP_GPUS=<N>; unset (or <2) makes the plugin a no-op, so
-`-p _parallel_warmup_plugin` can stay in the plugin list permanently.
+`-p _parallel_warmup_plugin` can stay in the plugin list permanently. Every entry of
+the shape set is split between the GPUs, so the benchmark is covered whichever entry
+it reads (its op_name, which need not be the test's name, or a class-name key).
 
 No new output structure: the merged configs land in the run's own
 autotune_records/<op>.json — the same path record mode writes and REPLAY_FROM
@@ -56,8 +58,14 @@ def _requested_gpus() -> int:
     try:
         want = int(raw)
     except ValueError:
-        return 0
+        want = -1
+    if want in (0, 1):
+        return 0  # the documented way to turn it off
     if want < 2:
+        # asked for and not given: say so, or the run just takes as long as before
+        from _term_style import tag
+        print(f"{tag('[parallel-warmup-plugin]')} {_GPUS_ENV}={raw!r} is not a GPU count of 2 or "
+              "more; sweeping serially", flush=True)
         return 0
     try:
         import torch
@@ -85,15 +93,13 @@ def _visible_devices() -> List[str]:
         return []
 
 
-def _read_shape_yaml(path: str, op: str) -> Tuple[List[Any], Dict[str, Any]]:
-    """Shapes for this op, plus the sibling keys to carry into each shard."""
+def _read_shape_yaml(path: str) -> Dict[str, Any]:
+    """The entries of the shape set that have shapes."""
     import yaml
     with open(path) as f:
         doc = yaml.safe_load(f) or {}
-    entry = doc.get(op) or {}
-    shapes = entry.get("shapes") or []
-    extra = {k: v for k, v in entry.items() if k != "shapes"}
-    return list(shapes), extra
+    return {key: entry for key, entry in doc.items()
+                if isinstance(entry, dict) and entry.get("shapes")}
 
 
 def _shard(shapes: List[Any], n: int) -> List[List[Any]]:
@@ -106,8 +112,30 @@ def _shard(shapes: List[Any], n: int) -> List[List[Any]]:
     return [s for s in (shapes[i::n] for i in range(n)) if s]
 
 
-def _spawn(shards: List[List[Any]], op: str, extra: Dict[str, Any],
-           scratch: Path, argv: List[str], devices: List[str]
+def _shard_entries(entries: Dict[str, Any], n: int) -> List[Dict[str, Any]]:
+    """The shape set cut into n sets, each entry's shapes dealt round-robin.
+
+    Every entry is cut, not just the one named after the test: which entry a benchmark
+    reads is its op_name, which need not be the test's name (FlagGems-vllm's
+    test_fused_marlin_moe_w4a16_mxfp4 reads fused_marlin_moe_w4a16), or a class-name
+    key. Cut the same way, whichever entry it reads is covered by the shards between
+    them.
+
+    An entry with fewer shapes than shards goes to the first shards only. A shard is
+    never left without an entry the others have: upstream would then fall back to the
+    next key (a class name) or to the benchmark's own shapes, and sweep shapes nobody
+    asked for. Such a shard repeats the entry's first shape instead: a config tuned
+    twice, which the merge counts as a conflict only if the winners differ.
+    """
+    shards: List[Dict[str, Any]] = [{} for _ in range(n)]
+    for key, entry in entries.items():
+        parts = _shard(list(entry["shapes"]), n)
+        for i in range(n):
+            shards[i][key] = dict(entry, shapes=parts[i] if i < len(parts) else parts[0][:1])
+    return shards
+
+
+def _spawn(shards: List[Dict[str, Any]], scratch: Path, argv: List[str], devices: List[str]
            ) -> Tuple[List[Path], List[int]]:
     """One subprocess per shard, each pinned to its own GPU.
 
@@ -121,11 +149,8 @@ def _spawn(shards: List[List[Any]], op: str, extra: Dict[str, Any],
     for i, shard in enumerate(shards):
         w = scratch / f"w{i}"
         w.mkdir(parents=True, exist_ok=True)
-        body = dict(extra)
-        body["shapes"] = shard
         (w / "shapes.yaml").write_text(
-            yaml.safe_dump({op: body}, sort_keys=False,
-                           default_flow_style=None, allow_unicode=True))
+            yaml.safe_dump(shard, sort_keys=False, default_flow_style=None, allow_unicode=True))
         rec = w / "rec"
         rec.mkdir(exist_ok=True)
 
@@ -234,14 +259,16 @@ def pytest_configure(config):
         return
 
     try:
-        shapes, extra = _read_shape_yaml(shape_file, op)
+        entries = _read_shape_yaml(shape_file)
     except Exception as exc:
         print(f"{tag('[parallel-warmup-plugin]')} cannot read shapes "
               f"({type(exc).__name__}: {exc}); skipping", flush=True)
         return
-    if len(shapes) < 2:
-        print(f"{tag('[parallel-warmup-plugin]')} only {len(shapes)} shape(s); "
-              "sharding would not pay off, skipping", flush=True)
+    most = max((len(e["shapes"]) for e in entries.values()), default=0)
+    if most < 2:
+        # e.g. the single-shape set: every entry would go to the first shard whole
+        print(f"{tag('[parallel-warmup-plugin]')} no entry of the shape set has two shapes "
+              "to split between GPUs; sweeping serially", flush=True)
         return
 
     devices = _visible_devices()
@@ -250,17 +277,16 @@ def pytest_configure(config):
               "GPU(s); nothing to parallelize, skipping", flush=True)
         return
 
-    shards = _shard(shapes, min(gpus, len(shapes), len(devices)))
+    shards = _shard_entries(entries, min(gpus, most, len(devices)))
     scratch = Path(tempfile.mkdtemp(prefix=f"warmup_{op}_"))
-    print(f"{tag('[parallel-warmup-plugin]')} sweeping {len(shapes)} shapes on "
-          f"{len(shards)} GPUs (shards: {[len(s) for s in shards]}); this phase's "
+    print(f"{tag('[parallel-warmup-plugin]')} sweeping on {len(shards)} GPUs: every entry of "
+          f"the shape set is split between them (up to {most} shapes); this phase's "
           "latency is discarded, only configs are kept", flush=True)
 
     keep_scratch = False
     t0 = time.time()
     try:
-        recs, bad = _spawn(shards, op, extra, scratch,
-                           list(config.invocation_params.args), devices)
+        recs, bad = _spawn(shards, scratch, list(config.invocation_params.args), devices)
         merged, total, conflicts = _merge(recs, op)
         elapsed = time.time() - t0
 
