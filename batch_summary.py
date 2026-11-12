@@ -35,8 +35,18 @@ NUM_TOKEN_RE = re.compile(
     r"|-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)$"
 )
 PYTEST_SKIPPED_RE = re.compile(r"(?P<n>\d+)\s+(?:skipped|xfailed)\b")
-DIRECT_NO_CUDAGRAPH_RE = re.compile(r"BENCHMARK_DIRECT_NO_CUDAGRAPH\b")
-REPLAY_FALLBACK_RE = re.compile(r"AUTOTUNE_REPLAY_FALLBACK\b")
+PYTEST_SUMMARY_RE = re.compile(r"^=+ (.*\bin [0-9.]+s\b.*) =+$", re.M)
+# Markers the plugins print into run.log, as (note for ops_status.csv, pattern). A note
+# with a count reads name=<n>; the others say that the marker occurred at all.
+COUNTED_MARKERS = (
+    ("no_cudagraph_rows", re.compile(r"BENCHMARK_DIRECT_NO_CUDAGRAPH\b")),
+    ("replay_fallback", re.compile(r"AUTOTUNE_REPLAY_FALLBACK\b")),
+    ("cudagraph_oom_retry", re.compile(r"CUDAGRAPH_OOM_RETRY\b")),
+)
+FLAG_MARKERS = (
+    ("shape_keys_unused", re.compile(r"SHAPE_KEYS_UNUSED\b")),
+    ("ir_dump_failed", re.compile(r"\b(?:IR_DUMP_FAILED|ROWS_TSV_FAILED)\b")),
+)
 
 SUMMARY_FIELDS = [
     "repo", "op", "fg_op_name", "dtype", "case_id", "row_status",
@@ -80,22 +90,30 @@ def parse_run_log(text: str) -> List[Dict[str, str]]:
 
 
 def pytest_skipped_count(text: str) -> int:
-    """Skipped + xfailed count: both mean no measurement, for the SKIP verdict."""
-    count = 0
-    for m in PYTEST_SKIPPED_RE.finditer(text[-4000:]):
-        count += int(m.group("n"))
-    return count
+    """Skipped + xfailed count: both mean no measurement, for the SKIP verdict.
+
+    Read from pytest's final summary line ("== 1 skipped, 2 warnings in 0.2s =="). The
+    line is not at the very end of run.log: the IR dump prints after it, one line per
+    shape, so a fixed window over the tail of the log would miss it on a long shape set
+    and turn a SKIP into a FAIL. Without such a line (a killed run) the
+    tail is searched.
+    """
+    summaries = PYTEST_SUMMARY_RE.findall(text)
+    scope = summaries[-1] if summaries else text[-4000:]
+    return sum(int(m.group("n")) for m in PYTEST_SKIPPED_RE.finditer(scope))
 
 
 def marker_notes(text: str) -> str:
-    """Counts of cudagraph-fallback / replay-fallback markers, for the notes column."""
+    """The markers of a run.log for the notes column: how many measurements fell back to
+    plain do_bench or to live tuning, and whether the run measured other shapes than the
+    shape file's or lost its IR dump. A reader of ops_status.csv sees them without
+    opening the log."""
     notes = []
-    n = len(DIRECT_NO_CUDAGRAPH_RE.findall(text))
-    if n:
-        notes.append(f"no_cudagraph_rows={n}")
-    n = len(REPLAY_FALLBACK_RE.findall(text))
-    if n:
-        notes.append(f"replay_fallback={n}")
+    for name, pattern in COUNTED_MARKERS:
+        n = len(pattern.findall(text))
+        if n:
+            notes.append(f"{name}={n}")
+    notes += [name for name, pattern in FLAG_MARKERS if pattern.search(text)]
     return ";".join(notes)
 
 
@@ -110,12 +128,16 @@ def classify(rc: int, rows: List[Dict[str, str]], log_text: str) -> str:
     return "PASS"
 
 
-def _load_ops_status(batch_dir: Path) -> Dict[str, Dict[str, str]]:
-    path = batch_dir / "ops_status.csv"
+def read_table(path: Path, delimiter: str = ",") -> List[Dict[str, str]]:
+    """The rows of a csv (or tsv) file with a header line; none if there is no such file."""
     if not path.is_file():
-        return {}
+        return []
     with path.open(newline="") as f:
-        return {f"{r['repo']}/{r['run_name']}": r for r in csv.DictReader(f)}
+        return list(csv.DictReader(f, delimiter=delimiter))
+
+
+def _load_ops_status(batch_dir: Path) -> Dict[str, Dict[str, str]]:
+    return {f"{r['repo']}/{r['run_name']}": r for r in read_table(batch_dir / "ops_status.csv")}
 
 
 def summarize(batch_dir: Path, out_path: Optional[Path] = None) -> Path:
@@ -174,8 +196,7 @@ def main() -> None:
     if not args.batch_dir.is_dir():
         raise SystemExit(f"no such dir: {args.batch_dir}")
     out = summarize(args.batch_dir, args.output)
-    with out.open(newline="") as f:
-        rows = list(csv.DictReader(f))
+    rows = read_table(out)
     n_ok = sum(1 for r in rows if r["row_status"] == "SUCCESS")
     n_bad = sum(1 for r in rows if r["row_status"] == "FAILED")
     print(f"[summary] {out}: {len(rows)} rows (SUCCESS={n_ok} FAILED={n_bad})",

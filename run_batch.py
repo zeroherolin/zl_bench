@@ -3,13 +3,14 @@
 
 Each op runs in its own subprocess (a CUDA crash only loses that op) with its
 own output dir <batch>/<repo>/<op>/, laid out exactly like a single-op
-run_pytest.sh run (run.log / shapes.yaml / autotune_records / ttgir / ttir).
+run_pytest.sh run (run.log / shapes.yaml / autotune_records / ttgir / ttir /
+rows.tsv).
 This layer only orchestrates:
 
 - sharding: ops are hashed to GPUs by name; each GPU runs its ops serially,
   timed exactly like a single-op run. Parallel GPUs couple through power and
-  thermals, so treat batch numbers as a screen and confirm suspects with
-  single-op runs;
+  thermals, so treat batch numbers as a screen and confirm suspects with a
+  repeated-measures A/B (ab_run.py);
 - timeout: --op-timeout kills a hung op (TIMEOUT, no retry, batch goes on);
 - retries: pytest rc=1 (failure/flaky) and signal kills (rc>=128) are retried
   up to twice, stopping early when the same rc repeats. Under --dtypes there
@@ -17,7 +18,7 @@ This layer only orchestrates:
   the filter (dtype_fallback), and any other failure with no SUCCESS row gets
   one last run without it (dtype_rescue);
 - resume: --resume reuses ops with a .complete marker (written for PASS/SKIP
-  only, so FAIL/TIMEOUT rerun);
+  only, so FAIL/TIMEOUT rerun) and keeps their rows of ops_status.csv;
 - replay: --replay-root points at an earlier batch dir and passes
   REPLAY_FROM=<root>/<repo>/<op> per op, same semantics as single-op replay;
 - idle GPUs: before each op starts, nvidia-smi must show no other process on
@@ -25,8 +26,9 @@ This layer only orchestrates:
   neighbour on the same GPU skews both the timing and the autotune choices.
   GPU numbers follow nvidia-smi (CUDA_DEVICE_ORDER=PCI_BUS_ID).
 
-Outputs: <batch>/ops_status.csv (one row per op) and summary.csv (one row per
-result-table row, written by batch_summary.py).
+Outputs: <batch>/ops_status.csv (one row per op the batch dir holds, also those
+an earlier invocation ran) and summary.csv (one row per result-table row,
+written by batch_summary.py).
 
 Examples:
   # Full screen (every collectable op of both repos, minus marked_skip and dismiss)
@@ -45,16 +47,16 @@ import argparse
 import csv
 import hashlib
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import batch_summary
 from gen_inventory import OPS_DIR, REPOS, ZL_BENCH
@@ -75,6 +77,19 @@ STATUS_FIELDS = [
 ]
 
 DTYPE_UNSUPPORTED_MARK = "can't be supported by this op"
+TERM_GRACE_S = 10  # between SIGTERM and SIGKILL when a run is stopped
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)  # stop the driver like Ctrl-C (run_workers)
+
+# Every run is a session of its own, so that a timeout can kill the whole process group.
+# That also means the runs do not get the terminal's Ctrl-C and outlive a driver that
+# simply dies: the driver has to stop them itself (stop_all).
+_stop = threading.Event()
+_children: Set[subprocess.Popen] = set()
+_children_lock = threading.Lock()
+
+
+class Interrupted(Exception):
+    """The driver is stopping (Ctrl-C): the op under way was cut short and has no result."""
 
 
 # ---------------- inventory and selection ----------------
@@ -200,7 +215,9 @@ def resolve_selection(args: argparse.Namespace,
         for e in errors:
             print(f"{LOG} error: {e}", file=sys.stderr)
         raise SystemExit(1)
-    return cases
+    # An op named twice (two op lists joined into one --ops-file) is one op: run twice,
+    # its two runs would write into the same dir at the same time.
+    return list(dict.fromkeys(cases))
 
 
 def add_selection_args(p: argparse.ArgumentParser) -> None:
@@ -285,9 +302,11 @@ def gpu_users(gpu: str) -> Optional[List[str]]:
     """What is using gpu (an nvidia-smi index or a GPU uuid): its processes, or the
     memory in use when no process is listed; empty when idle, None if nvidia-smi
     cannot tell."""
-    gpus = _smi(["--query-gpu=index,uuid,memory.used", "--format=csv,noheader,nounits"])
+    # -i asks about this GPU only: a query over all GPUs of a busy 8-GPU box takes
+    # several seconds, and it is made before every run.
+    gpus = _smi(["--query-gpu=index,uuid,memory.used", "--format=csv,noheader,nounits", "-i", gpu])
     apps = _smi(["--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
-                 "--format=csv,noheader,nounits"])
+                 "--format=csv,noheader,nounits", "-i", gpu])
     info = parse_gpus(gpus).get(gpu) if gpus else None
     if info is None or apps is None:
         return None
@@ -322,7 +341,8 @@ def wait_for_idle_gpu(gpu: str, policy: str) -> str:
     t0 = last = time.time()
     print(f"{LOG} gpu{gpu} is in use by {'; '.join(procs)}; waiting for it to be idle", flush=True)
     while procs:
-        time.sleep(BUSY_POLL_S)
+        if _stop.wait(BUSY_POLL_S):
+            raise Interrupted
         procs = gpu_users(gpu) or []
         if procs and time.time() - last >= BUSY_REPORT_S:
             last = time.time()
@@ -389,30 +409,89 @@ def replay_dir(case: Case, args: argparse.Namespace) -> Optional[Path]:
     return root if (root / "run.log").is_file() else root / case.repo / case.run_name
 
 
+def _signal_group(proc: subprocess.Popen, sig: int) -> None:
+    """Signal a run and everything it started (it leads its own process group)."""
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass  # the group is gone already
+
+
+def _group_alive(proc: subprocess.Popen) -> bool:
+    """The run's process group still has a member. The leader's exit does not settle
+    it: bash dies on SIGTERM at once, while the python it started may be in a CUDA call
+    that does not return for a while."""
+    try:
+        os.killpg(proc.pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # a member that changed its user: there, and not ours to signal
+        return True
+    return True
+
+
+def _terminate(procs: Sequence[subprocess.Popen]) -> None:
+    """SIGTERM the runs' process groups, SIGKILL what is left of them after TERM_GRACE_S."""
+    live = [p for p in procs if p.poll() is None or _group_alive(p)]
+    for p in live:
+        _signal_group(p, signal.SIGTERM)
+    deadline = time.time() + TERM_GRACE_S
+    for p in live:
+        try:
+            p.wait(timeout=max(0.0, deadline - time.time()))
+        except subprocess.TimeoutExpired:
+            pass
+    # The group of a reaped leader keeps its id while it has members, so the id cannot
+    # have been given to another process.
+    while any(_group_alive(p) for p in live) and time.time() < deadline:
+        time.sleep(0.05)
+    for p in live:
+        if _group_alive(p):
+            _signal_group(p, signal.SIGKILL)
+        p.wait()
+
+
+def stop_all() -> None:
+    """Let no further run start and stop the ones under way (Ctrl-C, SIGTERM)."""
+    _stop.set()
+    with _children_lock:
+        procs = list(_children)
+    _terminate(procs)
+
+
+def stopping() -> bool:
+    return _stop.is_set()
+
+
 def _wait(proc: subprocess.Popen, timeout: int) -> Tuple[int, bool]:
     """(rc, timed_out); on timeout the whole process group gets SIGTERM, then SIGKILL."""
+    with _children_lock:
+        _children.add(proc)
     try:
-        return proc.wait(timeout=timeout or None), False
-    except subprocess.TimeoutExpired:
+        if _stop.is_set():  # stop_all ran before this run was registered
+            _terminate([proc])
         try:
-            pgid = os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass  # the group exited right at the deadline
-        proc.wait()
-        return 124, True
+            return proc.wait(timeout=timeout or None), False
+        except subprocess.TimeoutExpired:
+            _terminate([proc])
+            return 124, True
+    finally:
+        with _children_lock:
+            _children.discard(proc)
 
 
-def run_case(case: Case, batch_dir: Path, gpu: str,
-             args: argparse.Namespace) -> Dict[str, str]:
+def run_case(case: Case, batch_dir: Path, gpu: str, args: argparse.Namespace,
+             previous: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Run one op, or with --resume reuse its finished run. previous is the op's row in
+    the batch dir's ops_status.csv, if it has one."""
     out_dir = batch_dir / case.repo / case.run_name
     marker = out_dir / ".complete"
 
     if args.resume and marker.is_file() and (out_dir / "run.log").is_file():
+        if previous and previous.get("status") in ("PASS", "SKIP"):
+            # the run's own row: the GPU it ran on, its time and its retries still hold
+            notes = [n for n in previous.get("notes", "").split(";") if n and n != "resumed"]
+            return dict(previous, notes=_join("resumed", *notes), out_dir=str(out_dir))
         row = _classify(case, out_dir, gpu, 0, 0, "", timed_out=False)
         row["notes"] = _join("resumed", row["notes"])
         return row
@@ -431,9 +510,8 @@ def run_case(case: Case, batch_dir: Path, gpu: str,
             log = out_dir / "run.log"
             if log.is_file():
                 log.rename(out_dir / f"run.attempt{attempt - 1}.log")
-        notes = _join(notes, wait_for_idle_gpu(gpu, getattr(args, "busy_gpu", "ignore")))
-        rc, timed_out = _wait(_spawn(case, out_dir, gpu, args, dtypes),
-                              args.op_timeout)
+        rc, timed_out, note = _attempt(case, out_dir, gpu, args, dtypes)
+        notes = _join(notes, note)
         rcs.append(rc)
         if timed_out:
             break
@@ -458,10 +536,8 @@ def run_case(case: Case, batch_dir: Path, gpu: str,
             log = out_dir / "run.log"
             if log.is_file():
                 log.rename(out_dir / f"run.attempt{len(rcs) - 1}.log")
-            notes = _join(notes, "dtype_rescue",
-                          wait_for_idle_gpu(gpu, getattr(args, "busy_gpu", "ignore")))
-            rc, timed_out = _wait(_spawn(case, out_dir, gpu, args, ""),
-                                  args.op_timeout)
+            rc, timed_out, note = _attempt(case, out_dir, gpu, args, "")
+            notes = _join(notes, "dtype_rescue", note)
             rcs.append(rc)
     elapsed_ms = int((time.time() - t0) * 1000)
 
@@ -473,6 +549,81 @@ def run_case(case: Case, batch_dir: Path, gpu: str,
         tmp.write_text(row["status"] + "\n")
         os.replace(tmp, marker)
     return row
+
+
+def _attempt(case: Case, out_dir: Path, gpu: str, args: argparse.Namespace,
+             dtypes: str) -> Tuple[int, bool, str]:
+    """One run of the op, once its GPU is idle: (rc, timed_out, note). Raises
+    Interrupted when the driver is stopping, before or during the run."""
+    if stopping():
+        raise Interrupted
+    note = wait_for_idle_gpu(gpu, getattr(args, "busy_gpu", "ignore"))
+    try:
+        rc, timed_out = _wait(_spawn(case, out_dir, gpu, args, dtypes), args.op_timeout)
+    finally:
+        # run_pytest.sh deletes its Triton cache itself, unless it was killed (a
+        # timeout, Ctrl-C): hundreds of MB per op would pile up in the batch dir.
+        shutil.rmtree(out_dir / ".triton_cache", ignore_errors=True)
+    if stopping():
+        raise Interrupted  # the run was cut short: its exit code means nothing
+    return rc, timed_out, note
+
+
+def run_workers(jobs: Sequence[Callable[[], None]]) -> bool:
+    """Run the jobs, one thread each, until they return. On Ctrl-C, SIGTERM or SIGHUP,
+    stop the runs under way (stop_all), wait for the jobs to wind down and return False.
+
+    The jobs must check stopping() between runs and let Interrupted pass. Any other
+    exception of a job is raised here once all jobs are done.
+    """
+    errors: List[BaseException] = []
+
+    def guarded(job: Callable[[], None]) -> None:
+        try:
+            job()
+        except Interrupted:
+            pass
+        except BaseException as exc:  # reported by the caller's thread, below
+            errors.append(exc)
+
+    def on_signal(signum, frame):
+        raise KeyboardInterrupt
+
+    # SIGTERM and a closed terminal (SIGHUP) stop the driver the way Ctrl-C does: left to
+    # their defaults they kill it, and its runs, sessions of their own, go on without it.
+    # A signal the caller ignores (nohup) stays ignored.
+    saved: Dict[int, object] = {}
+    in_main = threading.current_thread() is threading.main_thread()
+    if in_main:
+        for sig in STOP_SIGNALS:
+            if signal.getsignal(sig) is not signal.SIG_IGN:
+                saved[sig] = signal.signal(sig, on_signal)
+    threads = [threading.Thread(target=guarded, args=(job,)) for job in jobs]
+    completed = True
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    except KeyboardInterrupt:
+        completed = False
+        print(f"{LOG} interrupted: stopping the runs under way", flush=True)
+        if in_main:
+            # A second Ctrl-C must not cut this short: the runs would be left behind,
+            # which is what the first one asked to prevent. It takes TERM_GRACE_S at most.
+            saved.setdefault(signal.SIGINT, signal.getsignal(signal.SIGINT))
+            for sig in saved:
+                signal.signal(sig, signal.SIG_IGN)
+        stop_all()
+        for t in threads:
+            t.join()
+    finally:
+        for sig, handler in saved.items():
+            # None: a handler that was not installed from Python cannot be put back
+            signal.signal(sig, handler if handler is not None else signal.SIG_DFL)
+    if errors:
+        raise errors[0]
+    return completed
 
 
 def _read_log(out_dir: Path) -> str:
@@ -509,6 +660,29 @@ def _classify(case: Case, out_dir: Path, gpu: str, rc: int, elapsed_ms: int,
         "notes": _join(notes, batch_summary.marker_notes(text)),
         "out_dir": str(out_dir),
     }
+
+
+def status_rows(cases: Sequence[Case], results: Dict[str, Dict[str, str]],
+                previous: Dict[str, Dict[str, str]], batch_dir: Path) -> List[Dict[str, str]]:
+    """The rows of ops_status.csv: the selected ops in selection order, then the other
+    ops the batch dir holds. results are this invocation's rows, previous the ones an
+    earlier invocation left, both keyed by Case.key.
+
+    The file describes the batch dir, not one invocation, so an op that was not run this
+    time (not selected, or not reached before an interrupt) keeps its row. Except a
+    PASS/SKIP row whose run was started over and has not finished: that run dir no
+    longer holds the result the row describes (.complete is removed when a run starts).
+    """
+    def standing(case: Case) -> Optional[Dict[str, str]]:
+        row = previous.get(case.key)
+        if row and row.get("status") in ("PASS", "SKIP") \
+                and not (batch_dir / case.repo / case.run_name / ".complete").is_file():
+            return None
+        return row
+
+    rows = [results.get(c.key) or standing(c) for c in cases]
+    selected = {c.key for c in cases}
+    return [r for r in rows if r] + [r for key, r in previous.items() if key not in selected]
 
 
 # ---------------- main ----------------
@@ -584,21 +758,27 @@ def main() -> None:
     lock = threading.Lock()
     results: Dict[str, Dict[str, str]] = {}
     status_csv = batch_dir / "ops_status.csv"
+    previous = {f"{r['repo']}:{r['op']}@{r['op_file']}": r
+                    for r in batch_summary.read_table(status_csv)}
     wname = max((len(c.run_name) for c in cases), default=8)
 
     def flush_status() -> None:
-        rows = [results[c.key] for c in cases if c.key in results]
+        rows = status_rows(cases, results, previous, batch_dir)
         tmp = status_csv.with_name(status_csv.name + ".tmp")
         with tmp.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=STATUS_FIELDS)
+            writer = csv.DictWriter(f, fieldnames=STATUS_FIELDS, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
         os.replace(tmp, status_csv)
 
     def run_partition(gpu: str, part: List[Case]) -> None:
         for case in part:
+            if stopping():
+                return
             try:
-                row = run_case(case, batch_dir, gpu, args)
+                row = run_case(case, batch_dir, gpu, args, previous.get(case.key))
+            except Interrupted:
+                return
             except Exception as exc:  # a harness error must not take the shard down
                 row = {
                     "repo": case.repo, "op": case.op, "op_file": case.op_file,
@@ -617,15 +797,9 @@ def main() -> None:
                       + (f"  {row['notes']}" if row["notes"] else ""),
                       flush=True)
 
-    if len(parts) == 1:
-        gpu, part = next(iter(parts.items()))
-        run_partition(gpu, part)
-    else:
-        with ThreadPoolExecutor(max_workers=len(parts)) as pool:
-            futures = [pool.submit(run_partition, g, p) for g, p in parts.items()]
-            for f in futures:
-                f.result()
+    completed = run_workers([lambda g=g, p=p: run_partition(g, p) for g, p in parts.items()])
 
+    flush_status()  # also when no op finished, so the paths printed below exist
     summary = batch_summary.summarize(batch_dir)
     rows = [results[c.key] for c in cases if c.key in results]
     counts = {s: sum(1 for r in rows if r["status"] == s)
@@ -633,6 +807,10 @@ def main() -> None:
     print(f"{LOG} done: " + "  ".join(f"{k}={v}" for k, v in counts.items()))
     print(f"{LOG} status:  {status_csv}")
     print(f"{LOG} summary: {summary}")
+    if not completed:
+        print(f"{LOG} interrupted with {len(rows)} of {len(cases)} ops done; to go on: "
+              f"--batch-dir {batch_dir} --resume")
+        sys.exit(130)
     bad = [r for r in rows if r["status"] in ("FAIL", "TIMEOUT")]
     if bad:
         print(f"{LOG} failed: " +
