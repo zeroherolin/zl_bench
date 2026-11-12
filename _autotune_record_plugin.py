@@ -10,9 +10,9 @@ FLAGGEMS_PERF_CURRENT_OP):
 - FLAGGEMS_PERF_AUTOTUNE_RECORD_DIR: run full autotune, dump the chosen Config
   per (kernel, key) to <dir>/<op>.json at session end.
 - FLAGGEMS_PERF_AUTOTUNE_REPLAY_DIR: pre-populate Autotuner.cache from
-  <dir>/<op>.json, skipping the sweep. Missing key / non-compiling config /
-  missing json fall back to full autotune and emit an AUTOTUNE_REPLAY_FALLBACK
-  marker into the log.
+  <dir>/<op>.json, skipping the sweep. Missing kernel / missing key /
+  non-compiling config / missing json fall back to full autotune and emit an
+  AUTOTUNE_REPLAY_FALLBACK marker into the log.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ _LIBTUNER_PKGS = ("flag_gems", "flaggems_vllm")
 _record_map: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _record_lock = threading.Lock()
 _replay_map: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_unrecorded: set = set()  # tuned kernels the replayed record has no entry for (said once each)
 _dump_done = False
 _wrap = None  # set in pytest_configure when record/replay is active
 
@@ -83,7 +84,7 @@ def _serialize_config(cfg: Any, allow_pre_hook: bool = False) -> Optional[Dict[s
     if getattr(cfg, "pre_hook", None) is not None and not allow_pre_hook:
         return None
     try:
-        return {
+        entry = {
             "kwargs": dict(cfg.kwargs),
             "num_warps": cfg.num_warps,
             "num_stages": cfg.num_stages,
@@ -92,17 +93,25 @@ def _serialize_config(cfg: Any, allow_pre_hook: bool = False) -> Optional[Dict[s
         }
     except Exception:
         return None
+    # A config may replace a compile stage by a user-supplied IR file. Without it the
+    # replay would compile the kernel from source: another binary under the same config.
+    ir_override = getattr(cfg, "ir_override", None)
+    if ir_override is not None:
+        entry["ir_override"] = ir_override
+    return entry
 
 
 def _deserialize_config(entry: Dict[str, Any]) -> Any:
     # Late import (triton loads during collection, after plugin registration).
     from triton import Config
+    extra = {"ir_override": entry["ir_override"]} if entry.get("ir_override") is not None else {}
     return Config(
         kwargs=dict(entry["kwargs"]),
         num_warps=entry.get("num_warps", 4),
         num_stages=entry.get("num_stages", 3),
         num_ctas=entry.get("num_ctas", 1),
         maxnreg=entry.get("maxnreg"),
+        **extra,
     )
 
 
@@ -172,7 +181,16 @@ def _replay_run(original):
         if len(getattr(self, "configs", []) or []) > 1:
             kid = _kernel_id(self)
             bucket = _replay_map.get(kid)
-            if bucket:
+            if bucket is None:
+                # The record has nothing for this kernel: it tunes for itself, like a
+                # kernel with a missing key. A record made by this plugin has every
+                # tuned kernel the op ran, except those whose configs cannot be
+                # stored (a pre_hook on a plain triton Autotuner). Said once per
+                # kernel: it is the kernel that is missing, not one of its keys.
+                if _replay_map and kid not in _unrecorded:
+                    _unrecorded.add(kid)
+                    _emit_marker("kernel_missing")
+            else:
                 key = _compute_key(self, args, kwargs)
                 # Overwrite unconditionally: LibTuner.cache is backed by a
                 # persistent sqlite DB, so gating on `key not in self.cache`

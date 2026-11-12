@@ -80,6 +80,10 @@ def _pretty_str(self) -> str:
     # Same optional-column conditions as upstream.
     with_tflops = bool(metrics[0].tflops)
     with_gbps = metrics[0].gbps is not None
+    # Upstream's --base-data adds a "vs Base" column after the speedup. The parsers of
+    # run.log (batch_summary.py) read the first three numbers of a row by position, so
+    # the column keeps upstream's place.
+    with_base = any(getattr(m, "compared_speedup", None) is not None for m in metrics)
 
     legend, varying = _factor_static(_shape_rows(metrics))
     legend_line = ""
@@ -106,6 +110,8 @@ def _pretty_str(self) -> str:
         ("Gems Latency (ms)", 18, ">"),
         ("Gems Speedup", 13, ">"),
     ]
+    if with_base:
+        cols.append(("vs Base", 9, ">"))
     if with_tflops:
         cols.append(("TFLOPS", 13, ">"))
     if with_gbps:
@@ -124,6 +130,8 @@ def _pretty_str(self) -> str:
         cells.append(_num_cell(m.latency_base, ".6f", 19))
         cells.append(_num_cell(m.latency, ".6f", 18))
         cells.append(_num_cell(m.speedup, ".3f", 13))
+        if with_base:
+            cells.append(_num_cell(getattr(m, "compared_speedup", None), ".3f", 9))
         if with_tflops:
             cells.append(_num_cell(m.tflops, ".3f", 13))
         if with_gbps:
